@@ -1,0 +1,1 @@
+# keycloak-rabbitmq-extension
