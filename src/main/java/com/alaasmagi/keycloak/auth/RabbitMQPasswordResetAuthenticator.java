@@ -2,6 +2,7 @@ package com.alaasmagi.keycloak.auth;
 
 import com.alaasmagi.keycloak.events.DefaultEventTypes;
 import com.alaasmagi.keycloak.events.RabbitMQEmailEventPayloads;
+import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.jboss.logging.Logger;
@@ -16,12 +17,14 @@ import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 import org.keycloak.models.utils.FormMessage;
 import org.keycloak.services.messages.Messages;
+import org.keycloak.sessions.AuthenticationSessionCompoundId;
 import org.keycloak.sessions.AuthenticationSessionModel;
 
 import java.net.URI;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Map;
+import jakarta.ws.rs.core.Response;
 
 /**
  * Replaces Keycloak's default "Send Reset Email" step (ResetCredentialEmail).
@@ -40,9 +43,9 @@ import java.util.Map;
 public class RabbitMQPasswordResetAuthenticator implements Authenticator {
 
     private static final Logger LOG = Logger.getLogger(RabbitMQPasswordResetAuthenticator.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final RabbitMQConnectionManager connectionManager;
-    private final ObjectMapper mapper = new ObjectMapper();
 
     public RabbitMQPasswordResetAuthenticator(RabbitMQConnectionManager connectionManager) {
         this.connectionManager = connectionManager;
@@ -54,8 +57,6 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
         EventBuilder event = context.getEvent();
 
-        // If the previous step (username form) did not find a user, we must not
-        // reveal that - still show the "email sent" message (username enumeration protection).
         if (user == null) {
             genericSuccess(context);
             return;
@@ -74,7 +75,7 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
             int absoluteExpirationInSecs =
                     (int) (System.currentTimeMillis() / 1000L) + validityInSecs;
 
-            String authSessionEncodedId = authSession.getParentSession().getId();
+            String authSessionEncodedId = AuthenticationSessionCompoundId.fromAuthSession(authSession).getEncodedId();
 
             ResetCredentialsActionToken token = new ResetCredentialsActionToken(
                     user.getId(),
@@ -89,7 +90,16 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
 
             Instant expiresAt = Instant.now().plus(validityInSecs, ChronoUnit.SECONDS);
 
-            publishPasswordResetEvent(realm, user, actionTokenUrl.toString(), expiresAt, validityInSecs);
+            boolean published = publishPasswordResetEvent(realm, user, actionTokenUrl.toString(), expiresAt,
+                    validityInSecs);
+            if (!published) {
+                event.user(user).detail(Details.EMAIL, user.getEmail()).error(Errors.EMAIL_SEND_FAILED);
+                Response challenge = context.form()
+                        .setError(Messages.EMAIL_SENT_ERROR)
+                        .createErrorPage(Response.Status.INTERNAL_SERVER_ERROR);
+                context.failure(AuthenticationFlowError.INTERNAL_ERROR, challenge);
+                return;
+            }
 
             event.user(user)
                     .detail(Details.EMAIL, user.getEmail())
@@ -99,17 +109,19 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
             genericSuccess(context);
         } catch (Exception e) {
             LOG.error("Failed to generate/publish password reset event", e);
+            GlitchTipReporter.captureException(e, "password-reset.generate", Map.of(
+                    "eventType", DefaultEventTypes.PASSWORD_RESET,
+                    "realmName", context.getRealm().getName()
+            ));
             context.failure(AuthenticationFlowError.INTERNAL_ERROR);
         }
     }
 
     private void genericSuccess(AuthenticationFlowContext context) {
-        // Same UX as default Keycloak: the user sees a "check your email"
-        // message, regardless of whether the user/email actually existed.
         context.forkWithSuccessMessage(new FormMessage(Messages.EMAIL_SENT));
     }
 
-    private void publishPasswordResetEvent(RealmModel realm, UserModel user, String resetLink, Instant expiresAt,
+    private boolean publishPasswordResetEvent(RealmModel realm, UserModel user, String resetLink, Instant expiresAt,
                                             int validityInSecs) {
         try {
             Map<String, Object> payload = RabbitMQEmailEventPayloads.build(
@@ -121,14 +133,19 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
             );
 
             Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
-                    DefaultEventTypes.PasswordReset,
+                    DefaultEventTypes.PASSWORD_RESET,
                     realm.getName(),
                     payload
             );
 
-            connectionManager.publish(DefaultEventTypes.PasswordReset, mapper.writeValueAsBytes(message));
+            return connectionManager.publish(DefaultEventTypes.PASSWORD_RESET, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish password reset event to RabbitMQ", e);
+            GlitchTipReporter.captureException(e, "password-reset.publish", Map.of(
+                    "eventType", DefaultEventTypes.PASSWORD_RESET,
+                    "realmName", realm.getName()
+            ));
+            return false;
         }
     }
 
@@ -155,6 +172,6 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
 
     @Override
     public void close() {
-        // The connection is not closed here, see RabbitMQConnectionManager
+        // The connection is not closed here, see RabbitMQConnectionManagerHolder
     }
 }

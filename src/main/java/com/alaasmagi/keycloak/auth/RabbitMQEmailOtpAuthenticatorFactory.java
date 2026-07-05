@@ -1,6 +1,9 @@
 package com.alaasmagi.keycloak.auth;
 
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
+import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManagerHolder;
+import com.alaasmagi.keycloak.config.EnvConfig;
+import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import org.jboss.logging.Logger;
 import org.keycloak.Config;
 import org.keycloak.authentication.Authenticator;
@@ -47,17 +50,10 @@ public class RabbitMQEmailOtpAuthenticatorFactory implements AuthenticatorFactor
 
     @Override
     public void init(Config.Scope config) {
-        String host = getEnv("RABBITMQ_HOST", "rabbitmq");
-        int port = Integer.parseInt(getEnv("RABBITMQ_PORT", "5672"));
-        String username = getEnv("RABBITMQ_USERNAME", "guest");
-        String password = getEnv("RABBITMQ_PASSWORD", "guest");
-        String vhost = getEnv("RABBITMQ_VHOST", "/");
-        String exchange = getEnv("RABBITMQ_EXCHANGE", "identity-events");
-        this.validitySeconds = Integer.parseInt(getEnv("EMAIL_OTP_VALIDITY_SECONDS", "300"));
-
-        LOG.infof("Initializing RabbitMQ email OTP authenticator: host=%s exchange=%s validitySeconds=%d",
-                host, exchange, validitySeconds);
-        this.connectionManager = new RabbitMQConnectionManager(host, port, username, password, vhost, exchange);
+        GlitchTipReporter.initFromEnv();
+        this.validitySeconds = EnvConfig.getInt("EMAIL_OTP_VALIDITY_SECONDS", 300);
+        this.connectionManager = RabbitMQConnectionManagerHolder.acquire();
+        LOG.infof("RabbitMQ email OTP authenticator factory initialized (validitySeconds=%d)", validitySeconds);
     }
 
     @Override
@@ -67,9 +63,7 @@ public class RabbitMQEmailOtpAuthenticatorFactory implements AuthenticatorFactor
 
     @Override
     public void close() {
-        if (connectionManager != null) {
-            connectionManager.close();
-        }
+        RabbitMQConnectionManagerHolder.release();
     }
 
     @Override
@@ -111,10 +105,5 @@ public class RabbitMQEmailOtpAuthenticatorFactory implements AuthenticatorFactor
     @Override
     public List<ProviderConfigProperty> getConfigProperties() {
         return Collections.emptyList();
-    }
-
-    private static String getEnv(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return (value == null || value.isBlank()) ? defaultValue : value;
     }
 }

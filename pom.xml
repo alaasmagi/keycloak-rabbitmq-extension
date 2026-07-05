@@ -9,13 +9,14 @@
     <version>1.0.0</version>
     <packaging>jar</packaging>
 
-    <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <!-- Must match the Keycloak server version you are running (we saw 26.0.8 in the logs) -->
-        <keycloak.version>26.0.8</keycloak.version>
-    </properties>
+        <properties>
+            <maven.compiler.source>17</maven.compiler.source>
+            <maven.compiler.target>17</maven.compiler.target>
+            <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            <!-- Must match the Keycloak server version you are running (we saw 26.0.8 in the logs) -->
+            <keycloak.version>26.0.8</keycloak.version>
+            <sentry.version>8.47.0</sentry.version>
+        </properties>
 
     <dependencies>
         <!-- Keycloak SPI classes - PROVIDED, since the Keycloak server supplies these
@@ -75,6 +76,21 @@
             <artifactId>amqp-client</artifactId>
             <version>5.21.0</version>
         </dependency>
+
+        <!-- Optional GlitchTip/Sentry error reporting. This is packaged into the provider JAR
+             and is only initialized when GLITCHTIP_DSN is set. -->
+        <dependency>
+            <groupId>io.sentry</groupId>
+            <artifactId>sentry</artifactId>
+            <version>${sentry.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.3</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -84,6 +100,12 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.13.0</version>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
             </plugin>
 
             <!-- Shade plugin: bundles amqp-client (and its dependencies) into our JAR,

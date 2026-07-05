@@ -2,6 +2,7 @@ package com.alaasmagi.keycloak.auth;
 
 import com.alaasmagi.keycloak.events.DefaultEventTypes;
 import com.alaasmagi.keycloak.events.RabbitMQEmailEventPayloads;
+import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.jboss.logging.Logger;
@@ -42,15 +43,17 @@ import java.util.Map;
 public class RabbitMQEmailOtpAuthenticator implements Authenticator {
 
     private static final Logger LOG = Logger.getLogger(RabbitMQEmailOtpAuthenticator.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final String CODE_AUTH_NOTE = "rabbitmq-email-otp-code";
     private static final String EXPIRES_AUTH_NOTE = "rabbitmq-email-otp-expires";
+    private static final String ATTEMPTS_AUTH_NOTE = "rabbitmq-email-otp-attempts";
     private static final String FORM_FIELD_NAME = "otp";
     private static final int CODE_LENGTH = 6;
+    private static final int MAX_ATTEMPTS = 5;
 
     private final RabbitMQConnectionManager connectionManager;
     private final int validitySeconds;
-    private final ObjectMapper mapper = new ObjectMapper();
     private final SecureRandom random = new SecureRandom();
 
     public RabbitMQEmailOtpAuthenticator(RabbitMQConnectionManager connectionManager, int validitySeconds) {
@@ -82,8 +85,14 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
         authSession.setAuthNote(CODE_AUTH_NOTE, code);
         authSession.setAuthNote(EXPIRES_AUTH_NOTE, Long.toString(expiresAtEpochSeconds));
+        authSession.setAuthNote(ATTEMPTS_AUTH_NOTE, "0");
 
-        publishOtpEvent(context.getRealm(), user, code, expiresAtEpochSeconds);
+        boolean published = publishOtpEvent(context.getRealm(), user, code, expiresAtEpochSeconds);
+        if (!published) {
+            clearOtpNotes(authSession);
+            context.failure(AuthenticationFlowError.INTERNAL_ERROR);
+            return;
+        }
 
         context.challenge(context.form().createForm("login-otp.ftl"));
     }
@@ -107,21 +116,28 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
         boolean matches = expectedCode.equals(submittedCode);
 
         if (expired) {
-            authSession.removeAuthNote(CODE_AUTH_NOTE);
-            authSession.removeAuthNote(EXPIRES_AUTH_NOTE);
+            clearOtpNotes(authSession);
             context.failureChallenge(AuthenticationFlowError.EXPIRED_CODE,
                     context.form().setError("otpCodeExpired").createForm("login-otp.ftl"));
             return;
         }
 
         if (!matches) {
+            int attempts = incrementAttempts(authSession);
+            if (attempts >= MAX_ATTEMPTS) {
+                // Too many wrong guesses - fully fail the authentication rather
+                // than resetting the flow silently (which would happen on the
+                // next submit because the notes have been cleared).
+                clearOtpNotes(authSession);
+                context.failure(AuthenticationFlowError.ACCESS_DENIED);
+                return;
+            }
             context.failureChallenge(AuthenticationFlowError.INVALID_CREDENTIALS,
                     context.form().setError("otpCodeInvalid").createForm("login-otp.ftl"));
             return;
         }
 
-        authSession.removeAuthNote(CODE_AUTH_NOTE);
-        authSession.removeAuthNote(EXPIRES_AUTH_NOTE);
+        clearOtpNotes(authSession);
         context.success();
     }
 
@@ -136,7 +152,7 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
         return String.format("%0" + CODE_LENGTH + "d", value);
     }
 
-    private void publishOtpEvent(RealmModel realm, UserModel user, String code, long expiresAtEpochSeconds) {
+    private boolean publishOtpEvent(RealmModel realm, UserModel user, String code, long expiresAtEpochSeconds) {
         try {
             Map<String, Object> payload = RabbitMQEmailEventPayloads.build(
                     user,
@@ -147,15 +163,39 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
             );
 
             Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
-                    DefaultEventTypes.EmailOtp,
+                    DefaultEventTypes.EMAIL_OTP,
                     realm.getName(),
                     payload
             );
 
-            connectionManager.publish(DefaultEventTypes.EmailOtp, mapper.writeValueAsBytes(message));
+            return connectionManager.publish(DefaultEventTypes.EMAIL_OTP, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish email OTP event to RabbitMQ", e);
+            GlitchTipReporter.captureException(e, "email-otp.publish", Map.of(
+                    "eventType", DefaultEventTypes.EMAIL_OTP,
+                    "realmName", realm.getName()
+            ));
+            return false;
         }
+    }
+
+    private int incrementAttempts(AuthenticationSessionModel authSession) {
+        String rawAttempts = authSession.getAuthNote(ATTEMPTS_AUTH_NOTE);
+        int attempts;
+        try {
+            attempts = rawAttempts == null ? 0 : Integer.parseInt(rawAttempts);
+        } catch (NumberFormatException e) {
+            attempts = 0;
+        }
+        attempts++;
+        authSession.setAuthNote(ATTEMPTS_AUTH_NOTE, Integer.toString(attempts));
+        return attempts;
+    }
+
+    private void clearOtpNotes(AuthenticationSessionModel authSession) {
+        authSession.removeAuthNote(CODE_AUTH_NOTE);
+        authSession.removeAuthNote(EXPIRES_AUTH_NOTE);
+        authSession.removeAuthNote(ATTEMPTS_AUTH_NOTE);
     }
 
     @Override
@@ -178,6 +218,6 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
 
     @Override
     public void close() {
-        // The connection is not closed here, see RabbitMQConnectionManager
+        // The connection is not closed here, see RabbitMQConnectionManagerHolder
     }
 }

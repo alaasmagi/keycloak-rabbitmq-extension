@@ -37,9 +37,16 @@ RABBITMQ_VHOST=<your-rabbitmq-vhost>            # Default: /
 RABBITMQ_EXCHANGE=<your-rabbitmq-exchange>      # Default: identity-events
 
 EMAIL_OTP_VALIDITY_SECONDS=<otp-validity-time>  # Default: 300
+
+GLITCHTIP_DSN=<your-glitchtip-dsn>              # Optional, disabled when unset
+GLITCHTIP_ENVIRONMENT=<environment-name>        # Optional, default: production
+GLITCHTIP_RELEASE=<release-name>                # Optional, default: keycloak-rabbitmq-extension
+GLITCHTIP_SAMPLE_RATE=<0.0-to-1.0>              # Optional, default: 1.0
 ```
 
 These variables keep RabbitMQ access information outside the source code and make it possible to use different RabbitMQ hosts, virtual hosts and exchanges in different environments.
+
+GlitchTip reporting is optional. If `GLITCHTIP_DSN` is not set, the extension only uses normal Keycloak/JBoss logging.
 
 ### Building the extension
 
@@ -97,6 +104,11 @@ services:
       RABBITMQ_VHOST: "/"
       RABBITMQ_EXCHANGE: identity-events
       EMAIL_OTP_VALIDITY_SECONDS: "300"
+
+      GLITCHTIP_DSN: <your-glitchtip-dsn>
+      GLITCHTIP_ENVIRONMENT: production
+      GLITCHTIP_RELEASE: keycloak-rabbitmq-extension
+      GLITCHTIP_SAMPLE_RATE: "1.0"
 ```
 
 The RabbitMQ exchange is declared automatically by the extension as a durable topic exchange.
@@ -185,22 +197,45 @@ public class RabbitMQConnectionManager {
     private Connection connection;
     private Channel channel;
 
-    public synchronized void publish(String routingKey, byte[] body) {
+    public synchronized boolean publish(String routingKey, byte[] body) {
         if (channel == null || !channel.isOpen()) {
-            return;
+            reconnectIfDue();
+        }
+        if (channel == null || !channel.isOpen()) {
+            return false;
         }
         channel.basicPublish(exchangeName, routingKey, null, body);
+        return true;
     }
 }
 ```
 
-Each Keycloak factory creates its own `RabbitMQConnectionManager`, and provider/authenticator instances created by that factory reuse it. This avoids opening a new RabbitMQ connection for every Keycloak request.
+All four factories (event listener, password reset, verify email, email OTP) share a single `RabbitMQConnectionManager` instance via `RabbitMQConnectionManagerHolder`. The holder is reference-counted: each factory acquires the connection in `init()` and releases it in `close()`. The underlying AMQP connection is closed only when the last factory releases it (i.e. on Keycloak shutdown). This avoids opening multiple AMQP connections for a single Keycloak instance.
+
+If RabbitMQ is unavailable when Keycloak starts, the manager retries lazily on later publish attempts. Publishing returns a success flag so user-facing flows can avoid showing a reset, verification or OTP screen when the email message was not actually queued.
 
 The exchange is declared automatically with the following settings:
 
 * Type: `topic`
 * Durable: `true`
 * Auto-delete: `false`
+
+### GlitchTip error reporting
+
+GlitchTip reporting is handled through `GlitchTipReporter`, which uses the Sentry Java SDK with a GlitchTip DSN.
+
+The integration is disabled by default and becomes active only when `GLITCHTIP_DSN` is set. It reports exceptions from RabbitMQ connection/publish failures, password reset publishing, verify-email publishing, OTP publishing and event-listener serialization/inspection errors.
+
+The extension does not attach user email addresses, OTP codes, reset links, verify links, RabbitMQ credentials or raw Keycloak representations to GlitchTip events. Reported data is limited to exception details plus safe tags such as `operation`, `eventType`, `routingKey`, `realmName`, `exchange` and `component`.
+
+Supported environment variables:
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `GLITCHTIP_DSN` | No | unset | GlitchTip project DSN. Reporting is disabled when this is not set. |
+| `GLITCHTIP_ENVIRONMENT` | No | `production` | Environment label shown in GlitchTip. |
+| `GLITCHTIP_RELEASE` | No | `keycloak-rabbitmq-extension` | Release label shown in GlitchTip. |
+| `GLITCHTIP_SAMPLE_RATE` | No | `1.0` | Error event sample rate from `0.0` to `1.0`. |
 
 ### Event Listener
 
@@ -220,22 +255,140 @@ It publishes the following routing keys:
 | `client.deleted` | Client was deleted from the realm |
 | `email.identity-provider-link` | User triggered identity-provider account-linking email flow |
 
-Keycloak does not have a separate ban/unban event. This implementation treats the user's `enabled` flag as the source of truth and keeps an in-memory cache of the last known enabled state. This makes it possible to publish `user.enabled` and `user.disabled` only when the observed value changes.
+Keycloak does not have a separate ban/unban event. This implementation treats the user's `enabled` flag as the source of truth and keeps a bounded in-memory LRU cache (up to 10,000 entries) of the last known enabled state. This makes it possible to publish `user.enabled` and `user.disabled` only when the observed value changes.
 
 If the user has a custom attribute named `banReason`, it is included as a top-level `banReason` field in `user.disabled` and `user.enabled` messages.
 
-Example event listener message:
+#### Event listener message contract
+
+Event-listener messages use this top-level structure:
+
+```json
+{
+  "eventType": "user.created",
+  "realmName": "my-realm",
+  "userId": "13af8b9e-...",
+  "timestamp": "2026-07-02T20:45:00Z",
+  "representation": {
+    "id": "13af8b9e-...",
+    "enabled": true,
+    "email": "user@example.com"
+  }
+}
+```
+
+| Field | Type | Present when | Description |
+|---|---|---|---|
+| `eventType` | string | Always | Same value as the RabbitMQ routing key. |
+| `realmName` | string or null | Always | Human-readable Keycloak realm name when resolvable. Falls back to the realm id if lookup fails. |
+| `userId` | string or null | Always | Keycloak user id for user-related events. `null` for `client.deleted`. |
+| `timestamp` | string | Always | ISO-8601 UTC timestamp generated by the extension. |
+| `representation` | object | Admin events when Keycloak includes it | Parsed JSON representation from Keycloak. Consumers can read detailed user, role or client data directly from this object. |
+| `banReason` | string | Only `user.enabled` / `user.disabled` when present | First value of the custom user attribute `banReason`. |
+
+Event-listener structures by routing key:
+
+| Routing key | Structure notes |
+|---|---|
+| `user.created` | Self-registration has no `representation`; admin-created users may include `representation`. |
+| `user.deleted` | No `representation`; deleted-user email/details are not available after deletion. |
+| `user.updated` | May include `representation` from the admin update event. |
+| `user.enabled` | Includes `representation`; may include `banReason`. |
+| `user.disabled` | Includes `representation`; may include `banReason`. |
+| `user.role.assigned` | Includes role-mapping `representation` (array of role objects) when Keycloak provides it. |
+| `user.role.removed` | Includes role-mapping `representation` (array of role objects) when Keycloak provides it. |
+| `client.deleted` | `userId` is `null`; may include client `representation`. |
+| `email.identity-provider-link` | No `representation`; publishes only the generic event-listener envelope. |
+
+Example `user.disabled` message:
 
 ```json
 {
   "eventType": "user.disabled",
-  "realmName": "fitness",
+  "realmName": "my-realm",
   "userId": "13af8b9e-...",
   "timestamp": "2026-07-02T20:45:00Z",
   "banReason": "Spam / abuse",
-  "representation": "{\"id\":\"13af8b9e-...\",\"enabled\":false,\"email\":\"user@example.com\"}"
+  "representation": {
+    "id": "13af8b9e-...",
+    "enabled": false,
+    "email": "user@example.com"
+  }
 }
 ```
+
+Example `client.deleted` message:
+
+```json
+{
+  "eventType": "client.deleted",
+  "realmName": "my-realm",
+  "userId": null,
+  "timestamp": "2026-07-02T20:45:00Z",
+  "representation": {
+    "id": "7d4d...",
+    "clientId": "my-app"
+  }
+}
+```
+
+Example self-service `email.identity-provider-link` message:
+
+```json
+{
+  "eventType": "email.identity-provider-link",
+  "realmName": "my-realm",
+  "userId": "13af8b9e-...",
+  "timestamp": "2026-07-02T20:45:00Z"
+}
+```
+
+### Email message contract
+
+Password reset, verify-email and email OTP messages use this shared envelope:
+
+```json
+{
+  "eventType": "email.password-reset",
+  "eventSource": "identity",
+  "realmName": "my-realm",
+  "timestamp": "2026-07-02T20:45:00Z",
+  "payload": {
+    "userId": "13af8b9e-...",
+    "email": "user@example.com",
+    "resetLink": "https://identity.example.com/realms/my-realm/login-actions/action-token?key=...",
+    "expiresAt": "2026-07-02T21:45:00Z",
+    "expiresInMinutes": 60,
+    "locale": "et"
+  }
+}
+```
+
+| Field | Type | Present when | Description |
+|---|---|---|---|
+| `eventType` | string | Always | One of `email.password-reset`, `email.verify` or `email.2fa-otp`. |
+| `eventSource` | string | Always | Constant value: `identity`. |
+| `realmName` | string | Always | Human-readable Keycloak realm name. |
+| `timestamp` | string | Always | ISO-8601 UTC timestamp generated by the extension. |
+| `payload` | object | Always | Email-specific payload for the external email service. |
+
+Shared `payload` fields:
+
+| Field | Type | Present when | Description |
+|---|---|---|---|
+| `userId` | string | Always | Keycloak user id. |
+| `email` | string | Always | Destination email address. |
+| `expiresAt` | string | Always | ISO-8601 UTC expiration timestamp. |
+| `expiresInMinutes` | number | Always | Validity seconds divided by 60 using integer division. |
+| `locale` | string | User has non-blank `locale` attribute | Optional locale hint for the external email service. |
+
+Email-specific `payload` fields:
+
+| Event type | Field | Type | Description |
+|---|---|---|---|
+| `email.password-reset` | `resetLink` | string | Keycloak action-token URL for password reset. |
+| `email.verify` | `verifyLink` | string | Keycloak action-token URL for email verification. |
+| `email.2fa-otp` | `otpCode` | string | Six-digit email OTP code, including leading zeros when generated. |
 
 ### Password Reset Authenticator
 
@@ -243,18 +396,20 @@ Example event listener message:
 
 The authenticator generates a Keycloak reset credentials action token, builds the real reset link and publishes it to RabbitMQ.
 
+If publishing fails for a real user, the flow returns Keycloak's email-send error page instead of claiming that the reset email was sent. Unknown users and users without an email still receive the generic success message to avoid username enumeration.
+
 Example message:
 
 ```json
 {
   "eventType": "email.password-reset",
   "eventSource": "identity",
-  "realmName": "fitness",
+  "realmName": "my-realm",
   "timestamp": "2026-07-02T20:45:00Z",
   "payload": {
     "userId": "13af8b9e-...",
     "email": "user@example.com",
-    "resetLink": "https://identity.example.com/realms/fitness/login-actions/action-token?key=...",
+    "resetLink": "https://identity.example.com/realms/my-realm/login-actions/action-token?key=...",
     "expiresAt": "2026-07-02T21:45:00Z",
     "expiresInMinutes": 60,
     "locale": "et"
@@ -274,18 +429,20 @@ realm.getActionTokenGeneratedByUserLifespan()
 
 Clicking the link still uses Keycloak's own action-token endpoint, so this extension only replaces email delivery, not token validation.
 
+The required action stores a Keycloak authentication-session note after publishing, matching the built-in verify-email behavior so a simple page refresh does not publish another verification email. Explicit resend requests are rate-limited to once every 60 seconds per authentication session.
+
 Example message:
 
 ```json
 {
   "eventType": "email.verify",
   "eventSource": "identity",
-  "realmName": "fitness",
+  "realmName": "my-realm",
   "timestamp": "2026-07-02T20:45:00Z",
   "payload": {
     "userId": "13af8b9e-...",
     "email": "user@example.com",
-    "verifyLink": "https://identity.example.com/realms/fitness/login-actions/action-token?key=...",
+    "verifyLink": "https://identity.example.com/realms/my-realm/login-actions/action-token?key=...",
     "expiresAt": "2026-07-02T21:45:00Z",
     "expiresInMinutes": 60,
     "locale": "et"
@@ -310,6 +467,9 @@ The authenticator:
 * stores the expiration timestamp in the Keycloak authentication session
 * publishes the code to RabbitMQ
 * validates the code submitted through Keycloak's built-in `login-otp.ftl` form
+* clears the OTP after success, expiration or too many invalid attempts
+
+If OTP publishing fails, the authenticator does not show the OTP form. Invalid OTP submissions are capped at five attempts; reaching the limit fully denies the authentication (rather than silently resetting the flow).
 
 Example message:
 
@@ -317,7 +477,7 @@ Example message:
 {
   "eventType": "email.2fa-otp",
   "eventSource": "identity",
-  "realmName": "fitness",
+  "realmName": "my-realm",
   "timestamp": "2026-07-02T20:45:00Z",
   "payload": {
     "userId": "13af8b9e-...",
@@ -354,7 +514,7 @@ public static Map<String, Object> buildMessage(String eventType, String realmNam
 
 ### Dependency packaging
 
-The Maven Shade plugin packages the RabbitMQ client into the final JAR:
+The Maven Shade plugin packages the RabbitMQ client and Sentry Java SDK into the final JAR:
 
 ```xml
 <dependency>
@@ -362,6 +522,28 @@ The Maven Shade plugin packages the RabbitMQ client into the final JAR:
     <artifactId>amqp-client</artifactId>
     <version>5.21.0</version>
 </dependency>
+
+<dependency>
+    <groupId>io.sentry</groupId>
+    <artifactId>sentry</artifactId>
+    <version>${sentry.version}</version>
+</dependency>
 ```
 
 Keycloak dependencies are marked as `provided`, because they are supplied by the running Keycloak server.
+
+### Limitations
+
+This extension is tightly coupled to the Keycloak version configured in `pom.xml`, especially the password-reset and verify-email action-token classes from `keycloak-services`. Review and test those flows whenever the Keycloak version changes.
+
+Event-listener messages are best-effort: normal admin/user lifecycle events are logged if RabbitMQ publishing fails, but the original Keycloak admin action is not rolled back. User-facing email flows are stricter and fail the authentication step when their RabbitMQ message cannot be published.
+
+The `user.enabled` and `user.disabled` events rely on an in-memory last-known-state cache (bounded LRU, up to 10,000 entries). After a Keycloak restart, the first observed update for a user can emit an enabled/disabled event even if the enabled flag did not change in that update.
+
+### CI
+
+The repository includes a GitHub Actions workflow that runs:
+
+```bash
+mvn -q clean verify
+```

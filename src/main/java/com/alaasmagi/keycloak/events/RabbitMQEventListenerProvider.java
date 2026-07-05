@@ -1,6 +1,7 @@
 package com.alaasmagi.keycloak.events;
 
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
+import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.jboss.logging.Logger;
@@ -39,12 +40,10 @@ import java.util.Map;
  * expose the actual link/token via the Event details map.
  *
  * NOTE on "realmName" vs "realmId":
- * All messages published by this project (from this Event Listener as well
- * as the Password Reset Authenticator, Verify Email Required Action, and
- * Email OTP Authenticator) use a consistent "realmName" field (e.g.
- * "fitness"), never Keycloak's internal realm UUID. Event/AdminEvent objects
- * only give us the UUID, so it is resolved to the human-readable name via
- * the KeycloakSession passed in at provider creation time.
+ * All messages published by this project use a consistent "realmName" field
+ * (e.g. "my-realm"), never Keycloak's internal realm UUID. Event/AdminEvent
+ * objects only give us the UUID, so it is resolved to the human-readable name
+ * via the KeycloakSession passed in at provider creation time.
  *
  * NOTE on "timestamp":
  * All messages published by this project use an ISO-8601 UTC string (e.g.
@@ -84,11 +83,11 @@ import java.util.Map;
 public class RabbitMQEventListenerProvider implements EventListenerProvider {
 
     private static final Logger LOG = Logger.getLogger(RabbitMQEventListenerProvider.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final RabbitMQConnectionManager connectionManager;
     private final Map<String, Boolean> lastKnownEnabledState;
     private final KeycloakSession session;
-    private final ObjectMapper mapper = new ObjectMapper();
 
     public RabbitMQEventListenerProvider(RabbitMQConnectionManager connectionManager,
                                           Map<String, Boolean> lastKnownEnabledState,
@@ -109,16 +108,16 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
 
         switch (event.getType()) {
             case REGISTER:
-                publish(DefaultEventTypes.UserCreated, event.getRealmId(), event.getUserId(), null);
+                publish(DefaultEventTypes.USER_CREATED, event.getRealmId(), event.getUserId(), null);
                 break;
 
             case DELETE_ACCOUNT:
                 // User deleted THEIR OWN account via the Account Console
-                publish(DefaultEventTypes.UserDeleted, event.getRealmId(), event.getUserId(), null);
+                publish(DefaultEventTypes.USER_DELETED, event.getRealmId(), event.getUserId(), null);
                 break;
 
             case SEND_IDENTITY_PROVIDER_LINK:
-                publish(DefaultEventTypes.EmailIdentityProviderLink, event.getRealmId(), event.getUserId(), null);
+                publish(DefaultEventTypes.EMAIL_IDENTITY_PROVIDER_LINK, event.getRealmId(), event.getUserId(), null);
                 break;
 
             // SEND_VERIFY_EMAIL is intentionally NOT handled here. Once the
@@ -153,14 +152,14 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
             String representation = event.getRepresentation();
 
             if (operationType == OperationType.CREATE) {
-                publish(DefaultEventTypes.UserCreated, event.getRealmId(), userId, representation);
+                publish(DefaultEventTypes.USER_CREATED, event.getRealmId(), userId, representation);
             } else if (operationType == OperationType.DELETE) {
-                publish(DefaultEventTypes.UserDeleted, event.getRealmId(), userId, null);
+                publish(DefaultEventTypes.USER_DELETED, event.getRealmId(), userId, null);
                 if (userId != null) {
                     lastKnownEnabledState.remove(userId);
                 }
             } else if (operationType == OperationType.UPDATE) {
-                publish(DefaultEventTypes.UserUpdated, event.getRealmId(), userId, representation);
+                publish(DefaultEventTypes.USER_UPDATED, event.getRealmId(), userId, representation);
                 handlePossibleEnabledStateChange(event.getRealmId(), userId, representation);
             }
             return;
@@ -170,16 +169,16 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
                 || resourceType == ResourceType.CLIENT_ROLE_MAPPING) {
             String userId = extractFirstPathSegment(resourcePath);
             if (operationType == OperationType.CREATE) {
-                publish(DefaultEventTypes.UserRoleAssigned, event.getRealmId(), userId, event.getRepresentation());
+                publish(DefaultEventTypes.USER_ROLE_ASSIGNED, event.getRealmId(), userId, event.getRepresentation());
             } else if (operationType == OperationType.DELETE) {
-                publish(DefaultEventTypes.UserRoleRemoved, event.getRealmId(), userId, event.getRepresentation());
+                publish(DefaultEventTypes.USER_ROLE_REMOVED, event.getRealmId(), userId, event.getRepresentation());
             }
             return;
         }
 
         if (resourceType == ResourceType.CLIENT && operationType == OperationType.DELETE) {
             // A client (application/service) was deleted from the realm - userId does not apply here
-            publish(DefaultEventTypes.ClientDeleted, event.getRealmId(), null, event.getRepresentation());
+            publish(DefaultEventTypes.CLIENT_DELETED, event.getRealmId(), null, event.getRepresentation());
         }
     }
 
@@ -199,7 +198,7 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
         }
 
         try {
-            JsonNode node = mapper.readTree(representationJson);
+            JsonNode node = MAPPER.readTree(representationJson);
             if (!node.hasNonNull("enabled")) {
                 // Representation did not include the enabled field - nothing to compare.
                 return;
@@ -210,12 +209,15 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
 
             boolean stateChanged = previousEnabled == null || !previousEnabled.equals(currentEnabled);
             if (stateChanged) {
-                String routingKey = currentEnabled ? DefaultEventTypes.UserEnabled : DefaultEventTypes.UserDisabled;
+                String routingKey = currentEnabled ? DefaultEventTypes.USER_ENABLED : DefaultEventTypes.USER_DISABLED;
                 String banReason = extractBanReason(node);
                 publish(routingKey, realmId, userId, representationJson, banReason);
             }
         } catch (Exception e) {
             LOG.errorf(e, "Failed to inspect 'enabled' field on user %s representation", userId);
+            GlitchTipReporter.captureException(e, "event-listener.enabled-state-inspect", Map.of(
+                    "realmName", resolveRealmName(realmId)
+            ));
         }
     }
 
@@ -254,7 +256,7 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
 
     /**
      * Resolves Keycloak's internal realm UUID to its human-readable name
-     * (e.g. "fitness"), so every message published by this project uses a
+     * (e.g. "my-realm"), so every message published by this project uses a
      * consistent "realmName" field instead of the UUID. Falls back to
      * returning the UUID itself if the realm cannot be looked up (e.g. it
      * was deleted in the same transaction) so we never lose the information
@@ -269,6 +271,7 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
             return realm != null ? realm.getName() : realmId;
         } catch (Exception e) {
             LOG.errorf(e, "Failed to resolve realm name for realm id '%s'", realmId);
+            GlitchTipReporter.captureException(e, "event-listener.resolve-realm", null);
             return realmId;
         }
     }
@@ -289,26 +292,28 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
                 message.put("banReason", banReason);
             }
             if (representationJson != null) {
-                // Keycloak already provides this as a JSON string - keep it raw,
-                // the consumer can parse it further if it needs the details
-                // (including the user's email, which lives here rather than
-                // as a separate top-level field).
-                message.put("representation", representationJson);
+                // Parse the JSON string into a real JsonNode so it serializes
+                // as a nested object, not a double-encoded string.
+                message.put("representation", MAPPER.readTree(representationJson));
             }
 
-            byte[] body = mapper.writeValueAsBytes(message);
+            byte[] body = MAPPER.writeValueAsBytes(message);
             connectionManager.publish(routingKey, body);
         } catch (Exception e) {
             // Publishing an event must NEVER interrupt Keycloak's own action
             // (creating a user, deleting one, etc.) - so we swallow the
             // exception here and just log it.
             LOG.errorf(e, "Failed to build/publish event for routing key '%s'", routingKey);
+            GlitchTipReporter.captureException(e, "event-listener.publish", Map.of(
+                    "routingKey", routingKey,
+                    "realmName", resolveRealmName(realmId)
+            ));
         }
     }
 
     @Override
     public void close() {
-        // The connection is NOT closed here - it belongs to RabbitMQConnectionManager,
+        // The connection is NOT closed here - it belongs to RabbitMQConnectionManagerHolder,
         // which is shared across all provider instances (see the Factory).
     }
 }

@@ -2,6 +2,7 @@ package com.alaasmagi.keycloak.auth;
 
 import com.alaasmagi.keycloak.events.DefaultEventTypes;
 import com.alaasmagi.keycloak.events.RabbitMQEmailEventPayloads;
+import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.ws.rs.core.UriBuilder;
@@ -10,9 +11,11 @@ import org.keycloak.authentication.AuthenticationProcessor;
 import org.keycloak.authentication.RequiredActionContext;
 import org.keycloak.authentication.RequiredActionProvider;
 import org.keycloak.authentication.actiontoken.verifyemail.VerifyEmailActionToken;
+import org.keycloak.models.Constants;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 import org.keycloak.services.Urls;
+import org.keycloak.sessions.AuthenticationSessionCompoundId;
 import org.keycloak.sessions.AuthenticationSessionModel;
 
 import java.time.Instant;
@@ -40,9 +43,14 @@ import java.util.Map;
 public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider {
 
     private static final Logger LOG = Logger.getLogger(RabbitMQVerifyEmailRequiredAction.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /** Auth-note key that stores the epoch-second at which the last verification email was sent. */
+    private static final String LAST_SENT_AUTH_NOTE = "rabbitmq-verify-email-last-sent";
+    /** Minimum time in seconds a user must wait before a resend is allowed. */
+    private static final int RESEND_COOLDOWN_SECONDS = 60;
 
     private final RabbitMQConnectionManager connectionManager;
-    private final ObjectMapper mapper = new ObjectMapper();
 
     public RabbitMQVerifyEmailRequiredAction(RabbitMQConnectionManager connectionManager) {
         this.connectionManager = connectionManager;
@@ -73,10 +81,14 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
         try {
             RealmModel realm = context.getRealm();
             AuthenticationSessionModel authSession = context.getAuthenticationSession();
+            if (user.getEmail().equals(authSession.getAuthNote(Constants.VERIFY_EMAIL_KEY))) {
+                context.challenge(context.form().createResponse(UserModel.RequiredAction.VERIFY_EMAIL));
+                return;
+            }
 
             int validityInSecs = realm.getActionTokenGeneratedByUserLifespan(VerifyEmailActionToken.TOKEN_TYPE);
             int absoluteExpirationInSecs = (int) (System.currentTimeMillis() / 1000L) + validityInSecs;
-            String authSessionEncodedId = authSession.getParentSession().getId();
+            String authSessionEncodedId = AuthenticationSessionCompoundId.fromAuthSession(authSession).getEncodedId();
 
             VerifyEmailActionToken token = new VerifyEmailActionToken(
                     user.getId(),
@@ -99,7 +111,13 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
 
             Instant expiresAt = Instant.now().plus(validityInSecs, ChronoUnit.SECONDS);
 
-            publishVerifyEmailEvent(realm, user, verifyLink, expiresAt, validityInSecs);
+            boolean published = publishVerifyEmailEvent(realm, user, verifyLink, expiresAt, validityInSecs);
+            if (!published) {
+                context.failure();
+                return;
+            }
+            authSession.setAuthNote(Constants.VERIFY_EMAIL_KEY, user.getEmail());
+            authSession.setAuthNote(LAST_SENT_AUTH_NOTE, Long.toString(Instant.now().getEpochSecond()));
 
             // Same UX as the built-in action: show a "check your email" page.
             // login-verify-email.ftl is Keycloak's own base theme template -
@@ -107,18 +125,42 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
             context.challenge(context.form().createForm("login-verify-email.ftl"));
         } catch (Exception e) {
             LOG.error("Failed to generate/publish email verification event", e);
+            GlitchTipReporter.captureException(e, "verify-email.generate", Map.of(
+                    "eventType", DefaultEventTypes.VERIFY_EMAIL,
+                    "realmName", context.getRealm().getName()
+            ));
             context.failure();
         }
     }
 
+    /**
+     * Called when the user explicitly requests a resend from the verify-email page.
+     * Rate-limited to once per {@value #RESEND_COOLDOWN_SECONDS} seconds to
+     * prevent email flooding.
+     */
     @Override
     public void processAction(RequiredActionContext context) {
-        // No form input to process - the only way to complete this required
-        // action is by clicking the link, which is handled entirely by
-        // Keycloak's own VerifyEmailActionTokenHandler, not by this class.
+        AuthenticationSessionModel authSession = context.getAuthenticationSession();
+        String lastSentRaw = authSession.getAuthNote(LAST_SENT_AUTH_NOTE);
+        if (lastSentRaw != null) {
+            try {
+                long lastSentEpoch = Long.parseLong(lastSentRaw);
+                if (Instant.now().getEpochSecond() - lastSentEpoch < RESEND_COOLDOWN_SECONDS) {
+                    // Cooldown not elapsed yet - just redisplay the page without resending.
+                    context.challenge(context.form().createForm("login-verify-email.ftl"));
+                    return;
+                }
+            } catch (NumberFormatException ignored) {
+                // Malformed note - fall through and resend.
+            }
+        }
+        // Cooldown elapsed (or no prior send recorded) - clear the key so
+        // requiredActionChallenge() will send a fresh email.
+        authSession.removeAuthNote(Constants.VERIFY_EMAIL_KEY);
+        requiredActionChallenge(context);
     }
 
-    private void publishVerifyEmailEvent(RealmModel realm, UserModel user, String verifyLink, Instant expiresAt,
+    private boolean publishVerifyEmailEvent(RealmModel realm, UserModel user, String verifyLink, Instant expiresAt,
                                           int validityInSecs) {
         try {
             Map<String, Object> payload = RabbitMQEmailEventPayloads.build(
@@ -130,19 +172,24 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
             );
 
             Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
-                    DefaultEventTypes.VerifyEmail,
+                    DefaultEventTypes.VERIFY_EMAIL,
                     realm.getName(),
                     payload
             );
 
-            connectionManager.publish(DefaultEventTypes.VerifyEmail, mapper.writeValueAsBytes(message));
+            return connectionManager.publish(DefaultEventTypes.VERIFY_EMAIL, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish email verification event to RabbitMQ", e);
+            GlitchTipReporter.captureException(e, "verify-email.publish", Map.of(
+                    "eventType", DefaultEventTypes.VERIFY_EMAIL,
+                    "realmName", realm.getName()
+            ));
+            return false;
         }
     }
 
     @Override
     public void close() {
-        // The connection is not closed here, see RabbitMQConnectionManager
+        // The connection is not closed here, see RabbitMQConnectionManagerHolder
     }
 }

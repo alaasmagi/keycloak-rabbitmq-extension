@@ -1,6 +1,8 @@
 package com.alaasmagi.keycloak.auth;
 
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
+import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManagerHolder;
+import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import org.jboss.logging.Logger;
 import org.keycloak.Config;
 import org.keycloak.authentication.Authenticator;
@@ -29,8 +31,6 @@ public class RabbitMQPasswordResetAuthenticatorFactory implements AuthenticatorF
             AuthenticationExecutionModel.Requirement.DISABLED
     };
 
-    // Shared connection - created once, reused across all Authenticator
-    // instances (same pattern as the Event Listener extension).
     private RabbitMQConnectionManager connectionManager;
 
     @Override
@@ -40,15 +40,9 @@ public class RabbitMQPasswordResetAuthenticatorFactory implements AuthenticatorF
 
     @Override
     public void init(Config.Scope config) {
-        String host = getEnv("RABBITMQ_HOST", "rabbitmq");
-        int port = Integer.parseInt(getEnv("RABBITMQ_PORT", "5672"));
-        String username = getEnv("RABBITMQ_USERNAME", "guest");
-        String password = getEnv("RABBITMQ_PASSWORD", "guest");
-        String vhost = getEnv("RABBITMQ_VHOST", "/");
-        String exchange = getEnv("RABBITMQ_EXCHANGE", "identity-events");
-
-        LOG.infof("Initializing RabbitMQ password reset authenticator: host=%s exchange=%s", host, exchange);
-        this.connectionManager = new RabbitMQConnectionManager(host, port, username, password, vhost, exchange);
+        GlitchTipReporter.initFromEnv();
+        this.connectionManager = RabbitMQConnectionManagerHolder.acquire();
+        LOG.info("RabbitMQ password reset authenticator factory initialized");
     }
 
     @Override
@@ -58,9 +52,7 @@ public class RabbitMQPasswordResetAuthenticatorFactory implements AuthenticatorF
 
     @Override
     public void close() {
-        if (connectionManager != null) {
-            connectionManager.close();
-        }
+        RabbitMQConnectionManagerHolder.release();
     }
 
     @Override
@@ -101,10 +93,5 @@ public class RabbitMQPasswordResetAuthenticatorFactory implements AuthenticatorF
     @Override
     public List<ProviderConfigProperty> getConfigProperties() {
         return Collections.emptyList();
-    }
-
-    private static String getEnv(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return (value == null || value.isBlank()) ? defaultValue : value;
     }
 }

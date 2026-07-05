@@ -1,6 +1,8 @@
 package com.alaasmagi.keycloak.auth;
 
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
+import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManagerHolder;
+import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import org.jboss.logging.Logger;
 import org.keycloak.Config;
 import org.keycloak.authentication.RequiredActionFactory;
@@ -22,8 +24,6 @@ public class RabbitMQVerifyEmailRequiredActionFactory implements RequiredActionF
 
     public static final String PROVIDER_ID = "rabbitmq-verify-email";
 
-    // Shared connection - created once, reused across all RequiredActionProvider
-    // instances (same pattern as the other extensions in this project).
     private RabbitMQConnectionManager connectionManager;
 
     @Override
@@ -33,15 +33,9 @@ public class RabbitMQVerifyEmailRequiredActionFactory implements RequiredActionF
 
     @Override
     public void init(Config.Scope config) {
-        String host = getEnv("RABBITMQ_HOST", "rabbitmq");
-        int port = Integer.parseInt(getEnv("RABBITMQ_PORT", "5672"));
-        String username = getEnv("RABBITMQ_USERNAME", "guest");
-        String password = getEnv("RABBITMQ_PASSWORD", "guest");
-        String vhost = getEnv("RABBITMQ_VHOST", "/");
-        String exchange = getEnv("RABBITMQ_EXCHANGE", "identity-events");
-
-        LOG.infof("Initializing RabbitMQ verify email required action: host=%s exchange=%s", host, exchange);
-        this.connectionManager = new RabbitMQConnectionManager(host, port, username, password, vhost, exchange);
+        GlitchTipReporter.initFromEnv();
+        this.connectionManager = RabbitMQConnectionManagerHolder.acquire();
+        LOG.info("RabbitMQ verify email required action factory initialized");
     }
 
     @Override
@@ -51,9 +45,7 @@ public class RabbitMQVerifyEmailRequiredActionFactory implements RequiredActionF
 
     @Override
     public void close() {
-        if (connectionManager != null) {
-            connectionManager.close();
-        }
+        RabbitMQConnectionManagerHolder.release();
     }
 
     @Override
@@ -64,10 +56,5 @@ public class RabbitMQVerifyEmailRequiredActionFactory implements RequiredActionF
     @Override
     public String getDisplayText() {
         return "RabbitMQ Verify Email";
-    }
-
-    private static String getEnv(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return (value == null || value.isBlank()) ? defaultValue : value;
     }
 }
