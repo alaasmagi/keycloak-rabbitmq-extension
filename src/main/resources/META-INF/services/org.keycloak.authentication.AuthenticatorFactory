@@ -1,0 +1,2 @@
+com.alaasmagi.keycloak.auth.RabbitMQPasswordResetAuthenticatorFactory
+com.alaasmagi.keycloak.auth.RabbitMQEmailOtpAuthenticatorFactory

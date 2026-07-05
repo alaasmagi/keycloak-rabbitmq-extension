@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.alaasmagi</groupId>
+    <artifactId>keycloak-rabbitmq-extension</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- Must match the Keycloak server version you are running (we saw 26.0.8 in the logs) -->
+        <keycloak.version>26.0.8</keycloak.version>
+    </properties>
+
+    <dependencies>
+        <!-- Keycloak SPI classes - PROVIDED, since the Keycloak server supplies these
+             at runtime; they must not be bundled into the JAR -->
+        <dependency>
+            <groupId>org.keycloak</groupId>
+            <artifactId>keycloak-server-spi</artifactId>
+            <version>${keycloak.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.keycloak</groupId>
+            <artifactId>keycloak-server-spi-private</artifactId>
+            <version>${keycloak.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <!-- org.keycloak.Config lives here, not in server-spi -->
+            <groupId>org.keycloak</groupId>
+            <artifactId>keycloak-core</artifactId>
+            <version>${keycloak.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <!-- ResetCredentialsActionToken and other action token classes live here.
+                 WARNING: this is Keycloak's INTERNAL module, not a stable public API -
+                 this class may change across version upgrades (as already demonstrated
+                 by GitHub issue #19530 for the KC21 upgrade). ALWAYS review this
+                 extension when you upgrade your Keycloak version. -->
+            <groupId>org.keycloak</groupId>
+            <artifactId>keycloak-services</artifactId>
+            <version>${keycloak.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <!-- The Keycloak server bundles jboss-logging at runtime, but it does not
+                 come along as a transitive dependency of server-spi - we need it at compile-time -->
+            <groupId>org.jboss.logging</groupId>
+            <artifactId>jboss-logging</artifactId>
+            <version>3.5.3.Final</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Jackson - Keycloak/Quarkus already bundles this, use it as PROVIDED
+             to avoid class conflicts between two different Jackson versions -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.17.2</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- RabbitMQ client - this is NOT bundled with Keycloak, so it MUST
+             be packaged into the JAR (shade plugin below) -->
+        <dependency>
+            <groupId>com.rabbitmq</groupId>
+            <artifactId>amqp-client</artifactId>
+            <version>5.21.0</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>keycloak-rabbitmq-extension-${project.version}</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+
+            <!-- Shade plugin: bundles amqp-client (and its dependencies) into our JAR,
+                 so a single JAR file is enough in Keycloak's providers directory -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
