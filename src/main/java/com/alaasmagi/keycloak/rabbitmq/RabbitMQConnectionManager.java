@@ -13,7 +13,6 @@ import java.util.concurrent.TimeoutException;
 /**
  * Manages a single shared RabbitMQ connection and channel for the whole
  * Keycloak instance.
- *
  * This class is a singleton whose lifecycle is tied to the *Factory classes
  * (one instance per server), not to individual Provider instances (which get
  * created per request/session - we do not want to open a new AMQP connection
@@ -65,10 +64,10 @@ public class RabbitMQConnectionManager {
             this.channel = connection.createChannel();
 
             // Declares the exchange idempotently. If the exchange already exists
-            // with exactly these settings (topic, durable, not auto-delete), nothing happens.
+            // with exactly these settings (direct, durable, not auto-delete), nothing happens.
             // If it exists with different settings, this throws - check the
             // Management UI settings in that case.
-            this.channel.exchangeDeclare(exchangeName, "topic", true, false, null);
+            this.channel.exchangeDeclare(exchangeName, "direct", true, false, null);
 
             LOG.infof("RabbitMQ connection established, exchange '%s' ready", exchangeName);
         } catch (IOException | TimeoutException e) {
