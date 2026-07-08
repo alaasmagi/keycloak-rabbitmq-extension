@@ -67,7 +67,7 @@ public class RabbitMQConnectionManager {
             // with exactly these settings (direct, durable, not auto-delete), nothing happens.
             // If it exists with different settings, this throws - check the
             // Management UI settings in that case.
-            this.channel.exchangeDeclare(exchangeName, "direct", true, false, null);
+            this.channel.exchangeDeclare(exchangeName, "topic", true, false, null);
 
             LOG.infof("RabbitMQ connection established, exchange '%s' ready", exchangeName);
         } catch (IOException | TimeoutException e) {

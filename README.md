@@ -102,7 +102,7 @@ services:
       RABBITMQ_USERNAME: <your-rabbitmq-username>
       RABBITMQ_PASSWORD: <your-rabbitmq-password>
       RABBITMQ_VHOST: "/"
-      RABBITMQ_EXCHANGE: identity-events
+      RABBITMQ_EXCHANGE: identity-hub
       EMAIL_OTP_VALIDITY_SECONDS: "300"
 
       GLITCHTIP_DSN: <your-glitchtip-dsn>

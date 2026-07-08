@@ -36,7 +36,7 @@ public final class RabbitMQConnectionManagerHolder {
             String username = EnvConfig.get("RABBITMQ_USERNAME", "guest");
             String password = EnvConfig.get("RABBITMQ_PASSWORD", "guest");
             String vhost = EnvConfig.get("RABBITMQ_VHOST", "/");
-            String exchange = EnvConfig.get("RABBITMQ_EXCHANGE", "identity-events");
+            String exchange = EnvConfig.get("RABBITMQ_EXCHANGE", "identity-hub");
 
             LOG.infof("Creating shared RabbitMQ connection: host=%s port=%d vhost=%s exchange=%s",
                     host, port, vhost, exchange);
