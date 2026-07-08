@@ -82,7 +82,7 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
             RealmModel realm = context.getRealm();
             AuthenticationSessionModel authSession = context.getAuthenticationSession();
             if (user.getEmail().equals(authSession.getAuthNote(Constants.VERIFY_EMAIL_KEY))) {
-                context.challenge(context.form().createResponse(UserModel.RequiredAction.VERIFY_EMAIL));
+                challengeVerifyEmailPage(context);
                 return;
             }
 
@@ -116,13 +116,11 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
                 context.failure();
                 return;
             }
-            authSession.setAuthNote(Constants.VERIFY_EMAIL_KEY, user.getEmail());
             authSession.setAuthNote(LAST_SENT_AUTH_NOTE, Long.toString(Instant.now().getEpochSecond()));
+            authSession.setAuthNote(Constants.VERIFY_EMAIL_KEY, user.getEmail());
 
             // Same UX as the built-in action: show a "check your email" page.
-            // login-verify-email.ftl is Keycloak's own base theme template -
-            // reused as-is, since it is just a generic instructional page.
-            context.challenge(context.form().createForm("login-verify-email.ftl"));
+            challengeVerifyEmailPage(context);
         } catch (Exception e) {
             LOG.error("Failed to generate/publish email verification event", e);
             GlitchTipReporter.captureException(e, "verify-email.generate", Map.of(
@@ -147,7 +145,7 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
                 long lastSentEpoch = Long.parseLong(lastSentRaw);
                 if (Instant.now().getEpochSecond() - lastSentEpoch < RESEND_COOLDOWN_SECONDS) {
                     // Cooldown not elapsed yet - just redisplay the page without resending.
-                    context.challenge(context.form().createForm("login-verify-email.ftl"));
+                    challengeVerifyEmailPage(context);
                     return;
                 }
             } catch (NumberFormatException ignored) {
@@ -158,6 +156,10 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
         // requiredActionChallenge() will send a fresh email.
         authSession.removeAuthNote(Constants.VERIFY_EMAIL_KEY);
         requiredActionChallenge(context);
+    }
+
+    private void challengeVerifyEmailPage(RequiredActionContext context) {
+        context.challenge(context.form().createResponse(UserModel.RequiredAction.VERIFY_EMAIL));
     }
 
     private boolean publishVerifyEmailEvent(RealmModel realm, UserModel user, String verifyLink, Instant expiresAt,
