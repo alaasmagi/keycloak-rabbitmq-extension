@@ -13,8 +13,6 @@ import org.keycloak.events.admin.ResourceType;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 
-import java.time.Instant;
-import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -283,11 +281,8 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
     private void publish(String routingKey, String realmId, String userId, String representationJson,
                           String banReason) {
         try {
-            Map<String, Object> message = new LinkedHashMap<>();
-            message.put("eventType", routingKey);
-            message.put("realmName", resolveRealmName(realmId));
+            Map<String, Object> message = RabbitMQEventEnvelope.build(routingKey, resolveRealmName(realmId));
             message.put("userId", userId);
-            message.put("timestamp", Instant.now().toString());
             if (banReason != null) {
                 message.put("banReason", banReason);
             }

@@ -1,6 +1,8 @@
 package com.alaasmagi.keycloak.events;
 
 public final class DefaultEventTypes {
+    public static final String EVENT_SOURCE = "identity-hub";
+
     public static final String USER_CREATED = "user.created";
     public static final String USER_DELETED = "user.deleted";
     public static final String USER_UPDATED = "user.updated";

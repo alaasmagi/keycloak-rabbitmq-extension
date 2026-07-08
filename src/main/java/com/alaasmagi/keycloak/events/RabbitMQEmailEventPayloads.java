@@ -29,11 +29,7 @@ public final class RabbitMQEmailEventPayloads {
     }
 
     public static Map<String, Object> buildMessage(String eventType, String realmName, Map<String, Object> payload) {
-        Map<String, Object> message = new LinkedHashMap<>();
-        message.put("eventType", eventType);
-        message.put("eventSource", "identity");
-        message.put("realmName", realmName);
-        message.put("timestamp", Instant.now().toString());
+        Map<String, Object> message = RabbitMQEventEnvelope.build(eventType, realmName);
         message.put("payload", payload);
         return message;
     }

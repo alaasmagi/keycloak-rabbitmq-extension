@@ -49,6 +49,19 @@ class RabbitMQEmailEventPayloadsTest {
     }
 
     @Test
+    void buildsSharedMessageEnvelope() {
+        Map<String, Object> message = RabbitMQEventEnvelope.build(
+                DefaultEventTypes.USER_UPDATED,
+                "my-realm"
+        );
+
+        assertEquals(DefaultEventTypes.USER_UPDATED, message.get("eventType"));
+        assertEquals(DefaultEventTypes.EVENT_SOURCE, message.get("eventSource"));
+        assertEquals("my-realm", message.get("realmName"));
+        assertTrue(message.containsKey("timestamp"));
+    }
+
+    @Test
     void buildsMessageEnvelope() {
         Map<String, Object> payload = Map.of("userId", "user-123");
 
@@ -59,7 +72,7 @@ class RabbitMQEmailEventPayloadsTest {
         );
 
         assertEquals(DefaultEventTypes.EMAIL_OTP, message.get("eventType"));
-        assertEquals("identity", message.get("eventSource"));
+        assertEquals(DefaultEventTypes.EVENT_SOURCE, message.get("eventSource"));
         assertEquals("my-realm", message.get("realmName"));
         assertEquals(payload, message.get("payload"));
         assertTrue(message.containsKey("timestamp"));
