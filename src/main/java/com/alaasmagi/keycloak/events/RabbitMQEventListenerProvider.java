@@ -337,7 +337,7 @@ public class RabbitMQEventListenerProvider implements EventListenerProvider {
             message.put("content", content);
 
             byte[] body = MAPPER.writeValueAsBytes(message);
-            connectionManager.publish(action, body);
+            connectionManager.publish(type, body);
         } catch (Exception e) {
             // Publishing an event must NEVER interrupt Keycloak's own action
             // (creating a user, deleting one, etc.) - so we swallow the

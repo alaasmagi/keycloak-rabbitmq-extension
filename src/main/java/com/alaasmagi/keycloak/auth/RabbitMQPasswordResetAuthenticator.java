@@ -139,7 +139,7 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
                     content
             );
 
-            return connectionManager.publish(DefaultEventTypes.PASSWORD_RESET, MAPPER.writeValueAsBytes(message));
+            return connectionManager.publish(DefaultEventTypes.TYPE_EMAIL, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish password reset event to RabbitMQ", e);
             GlitchTipReporter.captureException(e, "password-reset.publish", Map.of(

@@ -169,7 +169,7 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
                     content
             );
 
-            return connectionManager.publish(DefaultEventTypes.EMAIL_OTP, MAPPER.writeValueAsBytes(message));
+            return connectionManager.publish(DefaultEventTypes.TYPE_EMAIL, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish email OTP event to RabbitMQ", e);
             GlitchTipReporter.captureException(e, "email-otp.publish", Map.of(

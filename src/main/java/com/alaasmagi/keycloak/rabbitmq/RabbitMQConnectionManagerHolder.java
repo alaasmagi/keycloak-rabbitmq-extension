@@ -36,11 +36,13 @@ public final class RabbitMQConnectionManagerHolder {
             String username = EnvConfig.get("RABBITMQ_USERNAME", "guest");
             String password = EnvConfig.get("RABBITMQ_PASSWORD", "guest");
             String vhost = EnvConfig.get("RABBITMQ_VHOST", "/");
-            String exchange = EnvConfig.get("RABBITMQ_EXCHANGE", "identity-hub");
+            String identityExchange = EnvConfig.get("RABBITMQ_IDENTITY_EXCHANGE", "identity.events");
+            String emailExchange = EnvConfig.get("RABBITMQ_EMAIL_EXCHANGE", "email.commands");
 
-            LOG.infof("Creating shared RabbitMQ connection: host=%s port=%d vhost=%s exchange=%s",
-                    host, port, vhost, exchange);
-            instance = new RabbitMQConnectionManager(host, port, username, password, vhost, exchange);
+            LOG.infof("Creating shared RabbitMQ connection: host=%s port=%d vhost=%s identityExchange=%s emailExchange=%s",
+                    host, port, vhost, identityExchange, emailExchange);
+            instance = new RabbitMQConnectionManager(host, port, username, password, vhost,
+                    identityExchange, emailExchange);
         }
         refCount++;
         LOG.debugf("RabbitMQ connection acquired (ref count: %d)", refCount);

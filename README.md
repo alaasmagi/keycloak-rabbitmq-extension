@@ -34,7 +34,8 @@ RABBITMQ_PORT=<your-rabbitmq-port>              # Default: 5672
 RABBITMQ_USERNAME=<your-rabbitmq-username>      # Default: guest
 RABBITMQ_PASSWORD=<your-rabbitmq-password>      # Default: guest
 RABBITMQ_VHOST=<your-rabbitmq-vhost>            # Default: /
-RABBITMQ_EXCHANGE=<your-rabbitmq-exchange>      # Default: identity-events
+RABBITMQ_IDENTITY_EXCHANGE=<identity-exchange>  # Default: identity.events
+RABBITMQ_EMAIL_EXCHANGE=<email-exchange>        # Default: email.commands
 
 EMAIL_OTP_VALIDITY_SECONDS=<otp-validity-time>  # Default: 300
 
@@ -45,6 +46,8 @@ GLITCHTIP_SAMPLE_RATE=<0.0-to-1.0>              # Optional, default: 1.0
 ```
 
 These variables keep RabbitMQ access information outside the source code and make it possible to use different RabbitMQ hosts, virtual hosts and exchanges in different environments.
+
+Messages are routed to one of two topic exchanges based on their envelope `type`: `user` and `client` events go to the identity exchange (`RABBITMQ_IDENTITY_EXCHANGE`, default `identity.events`), while `email` events (password reset, verify email, OTP) go to the email exchange (`RABBITMQ_EMAIL_EXCHANGE`, default `email.commands`).
 
 GlitchTip reporting is optional. If `GLITCHTIP_DSN` is not set, the extension only uses normal Keycloak/JBoss logging.
 
@@ -102,7 +105,8 @@ services:
       RABBITMQ_USERNAME: <your-rabbitmq-username>
       RABBITMQ_PASSWORD: <your-rabbitmq-password>
       RABBITMQ_VHOST: "/"
-      RABBITMQ_EXCHANGE: identity-hub
+      RABBITMQ_IDENTITY_EXCHANGE: identity.events
+      RABBITMQ_EMAIL_EXCHANGE: email.commands
       EMAIL_OTP_VALIDITY_SECONDS: "300"
 
       GLITCHTIP_DSN: <your-glitchtip-dsn>
@@ -111,7 +115,7 @@ services:
       GLITCHTIP_SAMPLE_RATE: "1.0"
 ```
 
-The RabbitMQ exchange is declared automatically by the extension as a durable topic exchange.
+The RabbitMQ exchanges are declared automatically by the extension as durable topic exchanges.
 
 ## Activation in Keycloak
 
@@ -192,18 +196,20 @@ RabbitMQ publishing is handled through `RabbitMQConnectionManager`.
 
 ```java
 public class RabbitMQConnectionManager {
-    private final String exchangeName;
+    private final String identityExchange;
+    private final String emailExchange;
     private Connection connection;
     private Channel channel;
 
-    public synchronized boolean publish(String routingKey, byte[] body) {
+    public synchronized boolean publish(String type, byte[] body) {
+        String exchangeName = "email".equals(type) ? emailExchange : identityExchange;
         if (channel == null || !channel.isOpen()) {
             reconnectIfDue();
         }
         if (channel == null || !channel.isOpen()) {
             return false;
         }
-        channel.basicPublish(exchangeName, routingKey, null, body);
+        channel.basicPublish(exchangeName, type, null, body);
         return true;
     }
 }
@@ -213,7 +219,7 @@ All four factories (event listener, password reset, verify email, email OTP) sha
 
 If RabbitMQ is unavailable when Keycloak starts, the manager retries lazily on later publish attempts. Publishing returns a success flag so user-facing flows can avoid showing a reset, verification or OTP screen when the email message was not actually queued.
 
-The exchange is declared automatically with the following settings:
+Both exchanges are declared automatically with the following settings:
 
 * Type: `topic`
 * Durable: `true`
@@ -240,24 +246,24 @@ Supported environment variables:
 
 The event listener is implemented with `RabbitMQEventListenerProvider` and `RabbitMQEventListenerProviderFactory`.
 
-It publishes the following routing keys:
+All event-listener messages are published to the identity exchange (`RABBITMQ_IDENTITY_EXCHANGE`). The RabbitMQ routing key is the envelope `type`, not the `action`: user and role events use routing key `user`, and client events use routing key `client`. The concrete thing that happened is carried in the `action` field of the message body:
 
-| Routing key | Description |
-|---|---|
-| `user.created` | User self-registered or was created by an admin |
-| `user.deleted` | User deleted their own account or was deleted by an admin |
-| `user.updated` | User data was updated by an admin |
-| `user.enabled` | User enabled flag changed to `true` |
-| `user.disabled` | User enabled flag changed to `false` |
-| `user.role.assigned` | Realm or client role was added to the user |
-| `user.role.removed` | Realm or client role was removed from the user |
-| `client.deleted` | Client was deleted from the realm |
+| `type` (routing key) | `action` | Description |
+|---|---|---|
+| `user` | `user.created` | User self-registered or was created by an admin |
+| `user` | `user.deleted` | User deleted their own account or was deleted by an admin |
+| `user` | `user.updated` | User data was updated by an admin |
+| `user` | `user.enabled` | User enabled flag changed to `true` |
+| `user` | `user.disabled` | User enabled flag changed to `false` |
+| `user` | `user.role.assigned` | Realm or client role was added to the user |
+| `user` | `user.role.removed` | Realm or client role was removed from the user |
+| `client` | `client.deleted` | Client was deleted from the realm |
 
 Keycloak does not have a separate ban/unban event. This implementation treats the user's `enabled` flag as the source of truth and keeps a bounded in-memory LRU cache (up to 10,000 entries) of the last known enabled state. This makes it possible to publish `user.enabled` and `user.disabled` only when the observed value changes.
 
 #### Event listener message contract
 
-Event-listener messages use the shared envelope: a `type` (category), a `source` (`identity.{realmName}`), an `action` (equal to the routing key), a `timestamp` and a `content` object:
+Event-listener messages use the shared envelope: a `type` (category, also the RabbitMQ routing key), a `source` (`identity.{realmName}`), an `action` (the concrete thing that happened), a `timestamp` and a `content` object:
 
 ```json
 {
@@ -277,9 +283,9 @@ Event-listener messages use the shared envelope: a `type` (category), a `source`
 
 | Field | Type | Present when | Description |
 |---|---|---|---|
-| `type` | string | Always | Message category: `user` for user/role events, `client` for `client.deleted`. |
+| `type` | string | Always | Message category and RabbitMQ routing key: `user` for user/role events, `client` for `client.deleted`. |
 | `source` | string | Always | `identity.{realmName}`, using the human-readable realm name when resolvable (falls back to the realm id). |
-| `action` | string | Always | Same value as the RabbitMQ routing key. |
+| `action` | string | Always | The concrete thing that happened (e.g. `user.created`). |
 | `timestamp` | string | Always | ISO-8601 UTC timestamp generated by the extension. |
 | `content` | object | Always | Event-specific content (see below). |
 
@@ -293,9 +299,9 @@ User `content` fields:
 | `fullName` | string | User has a first and/or last name | First and last name joined with a space. |
 | `locale` | string | User has non-blank `locale` attribute | Optional locale hint. |
 
-Event-listener structures by routing key:
+Event-listener structures by `action`:
 
-| Routing key | Structure notes |
+| `action` | Structure notes |
 |---|---|
 | `user.created` | `content` = `{ userId, email, username, fullName, locale }`. |
 | `user.deleted` | `content` = `{ userId }` only; the user no longer exists. |
@@ -343,7 +349,7 @@ Example `client.deleted` message:
 
 ### Email message contract
 
-Password reset, verify-email and email OTP messages use the shared envelope with `type` set to `email`:
+Password reset, verify-email and email OTP messages use the shared envelope with `type` set to `email`. They are published to the email exchange (`RABBITMQ_EMAIL_EXCHANGE`) with the routing key `email` (the envelope `type`); the specific email is identified by the `action` field:
 
 ```json
 {

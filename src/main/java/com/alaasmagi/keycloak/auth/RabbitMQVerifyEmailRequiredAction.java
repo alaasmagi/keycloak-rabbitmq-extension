@@ -180,7 +180,7 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
                     content
             );
 
-            return connectionManager.publish(DefaultEventTypes.VERIFY_EMAIL, MAPPER.writeValueAsBytes(message));
+            return connectionManager.publish(DefaultEventTypes.TYPE_EMAIL, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish email verification event to RabbitMQ", e);
             GlitchTipReporter.captureException(e, "verify-email.publish", Map.of(
