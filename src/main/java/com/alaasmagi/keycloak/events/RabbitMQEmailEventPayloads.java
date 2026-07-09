@@ -11,26 +11,61 @@ public final class RabbitMQEmailEventPayloads {
     private RabbitMQEmailEventPayloads() {
     }
 
+    /**
+     * Builds the "content" object for a user-facing email message, e.g.:
+     * <pre>
+     * {
+     *   "userId": "...",
+     *   "email": "user@example.com",
+     *   "fullName": "Firstname Lastname",
+     *   "actionLink": "https://.../action-token?key=...",   // or "otpCode": "482913"
+     *   "expiresAt": "2026-07-02T20:50:00Z",
+     *   "expiresInMinutes": 10,
+     *   "locale": "et"
+     * }
+     * </pre>
+     * The {@code eventParameterName}/{@code eventParameterValue} pair carries the
+     * action-specific field ("actionLink" for verify/password-reset, "otpCode"
+     * for 2FA).
+     */
     public static Map<String, Object> build(UserModel user, String eventParameterName, Object eventParameterValue,
                                             Instant expiresAt, int validityInSecs) {
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("userId", user.getId());
-        payload.put("email", user.getEmail());
-        payload.put(eventParameterName, eventParameterValue);
-        payload.put("expiresAt", expiresAt.toString());
-        payload.put("expiresInMinutes", validityInSecs / 60);
+        Map<String, Object> content = new LinkedHashMap<>();
+        content.put("userId", user.getId());
+        content.put("email", user.getEmail());
+
+        String fullName = fullName(user);
+        if (fullName != null) {
+            content.put("fullName", fullName);
+        }
+
+        content.put(eventParameterName, eventParameterValue);
+        content.put("expiresAt", expiresAt.toString());
+        content.put("expiresInMinutes", validityInSecs / 60);
 
         String locale = user.getFirstAttribute("locale");
         if (locale != null && !locale.isBlank()) {
-            payload.put("locale", locale);
+            content.put("locale", locale);
         }
 
-        return payload;
+        return content;
     }
 
-    public static Map<String, Object> buildMessage(String eventType, String realmName, Map<String, Object> payload) {
-        Map<String, Object> message = RabbitMQEventEnvelope.build(eventType, realmName);
-        message.put("payload", payload);
+    public static Map<String, Object> buildMessage(String type, String action, String realmName,
+                                                   Map<String, Object> content) {
+        Map<String, Object> message = RabbitMQEventEnvelope.build(type, action, realmName);
+        message.put("content", content);
         return message;
+    }
+
+    /**
+     * Joins the user's first and last name into a single "fullName" string,
+     * returning null when neither is set (so the field is omitted entirely).
+     */
+    private static String fullName(UserModel user) {
+        String first = user.getFirstName();
+        String last = user.getLastName();
+        String full = ((first == null ? "" : first) + " " + (last == null ? "" : last)).trim();
+        return full.isEmpty() ? null : full;
     }
 }

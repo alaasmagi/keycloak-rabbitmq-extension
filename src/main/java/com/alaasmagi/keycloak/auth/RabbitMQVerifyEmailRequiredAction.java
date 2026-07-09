@@ -124,7 +124,7 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
         } catch (Exception e) {
             LOG.error("Failed to generate/publish email verification event", e);
             GlitchTipReporter.captureException(e, "verify-email.generate", Map.of(
-                    "eventType", DefaultEventTypes.VERIFY_EMAIL,
+                    "action", DefaultEventTypes.VERIFY_EMAIL,
                     "realmName", context.getRealm().getName()
             ));
             context.failure();
@@ -165,25 +165,26 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
     private boolean publishVerifyEmailEvent(RealmModel realm, UserModel user, String verifyLink, Instant expiresAt,
                                           int validityInSecs) {
         try {
-            Map<String, Object> payload = RabbitMQEmailEventPayloads.build(
+            Map<String, Object> content = RabbitMQEmailEventPayloads.build(
                     user,
-                    "verifyLink",
+                    "actionLink",
                     verifyLink,
                     expiresAt,
                     validityInSecs
             );
 
             Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
+                    DefaultEventTypes.TYPE_EMAIL,
                     DefaultEventTypes.VERIFY_EMAIL,
                     realm.getName(),
-                    payload
+                    content
             );
 
             return connectionManager.publish(DefaultEventTypes.VERIFY_EMAIL, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish email verification event to RabbitMQ", e);
             GlitchTipReporter.captureException(e, "verify-email.publish", Map.of(
-                    "eventType", DefaultEventTypes.VERIFY_EMAIL,
+                    "action", DefaultEventTypes.VERIFY_EMAIL,
                     "realmName", realm.getName()
             ));
             return false;

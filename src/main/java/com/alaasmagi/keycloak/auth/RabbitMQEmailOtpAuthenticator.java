@@ -154,7 +154,7 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
 
     private boolean publishOtpEvent(RealmModel realm, UserModel user, String code, long expiresAtEpochSeconds) {
         try {
-            Map<String, Object> payload = RabbitMQEmailEventPayloads.build(
+            Map<String, Object> content = RabbitMQEmailEventPayloads.build(
                     user,
                     "otpCode",
                     code,
@@ -163,16 +163,17 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
             );
 
             Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
+                    DefaultEventTypes.TYPE_EMAIL,
                     DefaultEventTypes.EMAIL_OTP,
                     realm.getName(),
-                    payload
+                    content
             );
 
             return connectionManager.publish(DefaultEventTypes.EMAIL_OTP, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish email OTP event to RabbitMQ", e);
             GlitchTipReporter.captureException(e, "email-otp.publish", Map.of(
-                    "eventType", DefaultEventTypes.EMAIL_OTP,
+                    "action", DefaultEventTypes.EMAIL_OTP,
                     "realmName", realm.getName()
             ));
             return false;

@@ -14,30 +14,31 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RabbitMQEmailEventPayloadsTest {
 
     @Test
-    void buildsEmailPayloadWithLocaleAndMinuteExpiry() {
-        UserModel user = user("user-123", "person@example.com", "et");
+    void buildsEmailContentWithFullNameLocaleAndMinuteExpiry() {
+        UserModel user = user("user-123", "person@example.com", "Test", "User", "et");
 
-        Map<String, Object> payload = RabbitMQEmailEventPayloads.build(
+        Map<String, Object> content = RabbitMQEmailEventPayloads.build(
                 user,
-                "resetLink",
+                "actionLink",
                 "https://identity.example/reset",
                 Instant.parse("2026-07-02T20:45:00Z"),
                 3600
         );
 
-        assertEquals("user-123", payload.get("userId"));
-        assertEquals("person@example.com", payload.get("email"));
-        assertEquals("https://identity.example/reset", payload.get("resetLink"));
-        assertEquals("2026-07-02T20:45:00Z", payload.get("expiresAt"));
-        assertEquals(60, payload.get("expiresInMinutes"));
-        assertEquals("et", payload.get("locale"));
+        assertEquals("user-123", content.get("userId"));
+        assertEquals("person@example.com", content.get("email"));
+        assertEquals("Test User", content.get("fullName"));
+        assertEquals("https://identity.example/reset", content.get("actionLink"));
+        assertEquals("2026-07-02T20:45:00Z", content.get("expiresAt"));
+        assertEquals(60, content.get("expiresInMinutes"));
+        assertEquals("et", content.get("locale"));
     }
 
     @Test
-    void omitsBlankLocale() {
-        UserModel user = user("user-123", "person@example.com", " ");
+    void omitsBlankLocaleAndFullName() {
+        UserModel user = user("user-123", "person@example.com", null, null, " ");
 
-        Map<String, Object> payload = RabbitMQEmailEventPayloads.build(
+        Map<String, Object> content = RabbitMQEmailEventPayloads.build(
                 user,
                 "otpCode",
                 "123456",
@@ -45,46 +46,52 @@ class RabbitMQEmailEventPayloadsTest {
                 300
         );
 
-        assertFalse(payload.containsKey("locale"));
+        assertEquals("123456", content.get("otpCode"));
+        assertFalse(content.containsKey("locale"));
+        assertFalse(content.containsKey("fullName"));
     }
 
     @Test
-    void buildsSharedMessageEnvelope() {
+    void buildsSharedEnvelope() {
         Map<String, Object> message = RabbitMQEventEnvelope.build(
+                DefaultEventTypes.TYPE_USER,
                 DefaultEventTypes.USER_UPDATED,
                 "my-realm"
         );
 
-        assertEquals(DefaultEventTypes.USER_UPDATED, message.get("eventType"));
-        assertEquals(DefaultEventTypes.EVENT_SOURCE, message.get("eventSource"));
-        assertEquals("my-realm", message.get("realmName"));
+        assertEquals(DefaultEventTypes.TYPE_USER, message.get("type"));
+        assertEquals("identity.my-realm", message.get("source"));
+        assertEquals(DefaultEventTypes.USER_UPDATED, message.get("action"));
         assertTrue(message.containsKey("timestamp"));
     }
 
     @Test
-    void buildsMessageEnvelope() {
-        Map<String, Object> payload = Map.of("userId", "user-123");
+    void buildsMessageEnvelopeWithContent() {
+        Map<String, Object> content = Map.of("userId", "user-123");
 
         Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
+                DefaultEventTypes.TYPE_EMAIL,
                 DefaultEventTypes.EMAIL_OTP,
                 "my-realm",
-                payload
+                content
         );
 
-        assertEquals(DefaultEventTypes.EMAIL_OTP, message.get("eventType"));
-        assertEquals(DefaultEventTypes.EVENT_SOURCE, message.get("eventSource"));
-        assertEquals("my-realm", message.get("realmName"));
-        assertEquals(payload, message.get("payload"));
+        assertEquals(DefaultEventTypes.TYPE_EMAIL, message.get("type"));
+        assertEquals("identity.my-realm", message.get("source"));
+        assertEquals(DefaultEventTypes.EMAIL_OTP, message.get("action"));
+        assertEquals(content, message.get("content"));
         assertTrue(message.containsKey("timestamp"));
     }
 
-    private static UserModel user(String id, String email, String locale) {
+    private static UserModel user(String id, String email, String firstName, String lastName, String locale) {
         return (UserModel) Proxy.newProxyInstance(
                 UserModel.class.getClassLoader(),
                 new Class<?>[]{UserModel.class},
                 (proxy, method, args) -> switch (method.getName()) {
                     case "getId" -> id;
                     case "getEmail" -> email;
+                    case "getFirstName" -> firstName;
+                    case "getLastName" -> lastName;
                     case "getFirstAttribute" -> "locale".equals(args[0]) ? locale : null;
                     default -> throw new UnsupportedOperationException(method.getName());
                 }

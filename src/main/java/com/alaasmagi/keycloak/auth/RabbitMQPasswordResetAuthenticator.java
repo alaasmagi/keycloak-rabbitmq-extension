@@ -110,7 +110,7 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
         } catch (Exception e) {
             LOG.error("Failed to generate/publish password reset event", e);
             GlitchTipReporter.captureException(e, "password-reset.generate", Map.of(
-                    "eventType", DefaultEventTypes.PASSWORD_RESET,
+                    "action", DefaultEventTypes.PASSWORD_RESET,
                     "realmName", context.getRealm().getName()
             ));
             context.failure(AuthenticationFlowError.INTERNAL_ERROR);
@@ -124,25 +124,26 @@ public class RabbitMQPasswordResetAuthenticator implements Authenticator {
     private boolean publishPasswordResetEvent(RealmModel realm, UserModel user, String resetLink, Instant expiresAt,
                                             int validityInSecs) {
         try {
-            Map<String, Object> payload = RabbitMQEmailEventPayloads.build(
+            Map<String, Object> content = RabbitMQEmailEventPayloads.build(
                     user,
-                    "resetLink",
+                    "actionLink",
                     resetLink,
                     expiresAt,
                     validityInSecs
             );
 
             Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
+                    DefaultEventTypes.TYPE_EMAIL,
                     DefaultEventTypes.PASSWORD_RESET,
                     realm.getName(),
-                    payload
+                    content
             );
 
             return connectionManager.publish(DefaultEventTypes.PASSWORD_RESET, MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish password reset event to RabbitMQ", e);
             GlitchTipReporter.captureException(e, "password-reset.publish", Map.of(
-                    "eventType", DefaultEventTypes.PASSWORD_RESET,
+                    "action", DefaultEventTypes.PASSWORD_RESET,
                     "realmName", realm.getName()
             ));
             return false;
