@@ -2,6 +2,7 @@ package com.alaasmagi.keycloak.events;
 
 import org.keycloak.models.UserModel;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -9,6 +10,16 @@ import java.util.Map;
 public final class RabbitMQEmailEventPayloads {
 
     private RabbitMQEmailEventPayloads() {
+    }
+
+    /**
+     * Milliseconds remaining until {@code expiresAt}, used as the AMQP
+     * per-message expiration (TTL) for email commands so the broker drops a
+     * code/link that has already outlived its own validity. Clamped to zero so
+     * an already-expired instant never produces a negative TTL.
+     */
+    public static long expirationMillis(Instant expiresAt) {
+        return Math.max(0L, Duration.between(Instant.now(), expiresAt).toMillis());
     }
 
     /**
@@ -20,13 +31,14 @@ public final class RabbitMQEmailEventPayloads {
      *   "fullName": "Firstname Lastname",
      *   "actionLink": "https://.../action-token?key=...",   // or "otpCode": "482913"
      *   "expiresAt": "2026-07-02T20:50:00Z",
-     *   "expiresInMinutes": 10,
+     *   "validForMinutes": 10,
      *   "locale": "et"
      * }
      * </pre>
      * The {@code eventParameterName}/{@code eventParameterValue} pair carries the
      * action-specific field ("actionLink" for verify/password-reset, "otpCode"
-     * for 2FA).
+     * for 2FA). {@code validForMinutes} is derived from the realm's configured
+     * action-token/OTP lifespan, never hard-coded.
      */
     public static Map<String, Object> build(UserModel user, String eventParameterName, Object eventParameterValue,
                                             Instant expiresAt, int validityInSecs) {
@@ -41,7 +53,7 @@ public final class RabbitMQEmailEventPayloads {
 
         content.put(eventParameterName, eventParameterValue);
         content.put("expiresAt", expiresAt.toString());
-        content.put("expiresInMinutes", validityInSecs / 60);
+        content.put("validForMinutes", validityInSecs / 60);
 
         String locale = user.getFirstAttribute("locale");
         if (locale != null && !locale.isBlank()) {
@@ -51,9 +63,9 @@ public final class RabbitMQEmailEventPayloads {
         return content;
     }
 
-    public static Map<String, Object> buildMessage(String type, String action, String realmName,
+    public static Map<String, Object> buildMessage(String action, String realmName,
                                                    Map<String, Object> content) {
-        Map<String, Object> message = RabbitMQEventEnvelope.build(type, action, realmName);
+        Map<String, Object> message = RabbitMQEventEnvelope.build(action, realmName);
         message.put("content", content);
         return message;
     }

@@ -1,6 +1,7 @@
 package com.alaasmagi.keycloak.rabbitmq;
 
 import com.alaasmagi.keycloak.observability.GlitchTipReporter;
+import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
@@ -17,15 +18,23 @@ import java.util.concurrent.TimeoutException;
  * (one instance per server), not to individual Provider instances (which get
  * created per request/session - we do not want to open a new AMQP connection
  * for every single event).
+ *
+ * <p>The channel runs in publisher-confirm mode: {@link #publish} does not
+ * report success until the broker has acked the message, bounded by a timeout
+ * so a hung broker cannot block a caller (e.g. a login thread) indefinitely.
+ *
+ * <p>This class does NOT declare exchanges. The topology (exchanges, queues,
+ * bindings) is created and owned outside this extension. Declaring an exchange
+ * here with arguments that did not match the existing one would throw
+ * PRECONDITION_FAILED and take the channel down, after which nothing would be
+ * published.
  */
 public class RabbitMQConnectionManager {
 
     private static final Logger LOG = Logger.getLogger(RabbitMQConnectionManager.class);
     private static final long RECONNECT_INTERVAL_MILLIS = 5000;
-
-    // Envelope "type" value that should be routed to the email exchange.
-    // Everything else (user, client, ...) goes to the identity exchange.
-    private static final String EMAIL_TYPE = "email";
+    private static final String CONTENT_TYPE_JSON = "application/json";
+    private static final int DELIVERY_MODE_PERSISTENT = 2;
 
     private final String host;
     private final int port;
@@ -34,12 +43,14 @@ public class RabbitMQConnectionManager {
     private final String virtualHost;
     private final String identityExchange;
     private final String emailExchange;
+    private final int confirmTimeoutMillis;
     private Connection connection;
     private Channel channel;
     private long lastReconnectAttemptMillis;
 
     public RabbitMQConnectionManager(String host, int port, String username, String password,
-                                      String virtualHost, String identityExchange, String emailExchange) {
+                                      String virtualHost, String identityExchange, String emailExchange,
+                                      int confirmTimeoutMillis) {
         this.host = host;
         this.port = port;
         this.username = username;
@@ -47,7 +58,18 @@ public class RabbitMQConnectionManager {
         this.virtualHost = virtualHost;
         this.identityExchange = identityExchange;
         this.emailExchange = emailExchange;
+        this.confirmTimeoutMillis = confirmTimeoutMillis;
         connect();
+    }
+
+    /** The exchange user facts (the event listener) publish to. */
+    public String identityExchange() {
+        return identityExchange;
+    }
+
+    /** The exchange email commands (the auth/required-action flows) publish to. */
+    public String emailExchange() {
+        return emailExchange;
     }
 
     private void connect() {
@@ -69,14 +91,15 @@ public class RabbitMQConnectionManager {
             this.connection = factory.newConnection("keycloak-rabbitmq-extension");
             this.channel = connection.createChannel();
 
-            // Declares the exchanges idempotently. If an exchange already exists
-            // with exactly these settings (topic, durable, not auto-delete), nothing happens.
-            // If it exists with different settings, this throws - check the
-            // Management UI settings in that case.
-            this.channel.exchangeDeclare(identityExchange, "topic", true, false, null);
-            this.channel.exchangeDeclare(emailExchange, "topic", true, false, null);
+            // Publisher confirms: a non-throwing basicPublish only means the
+            // client handed the frame off, NOT that the broker accepted it.
+            // With confirms on we can wait for the broker's ack (see publish()).
+            this.channel.confirmSelect();
 
-            LOG.infof("RabbitMQ connection established, exchanges '%s' (identity) and '%s' (email) ready",
+            // NOTE: exchanges are intentionally NOT declared here - the topology
+            // is created and owned outside this extension (see the class Javadoc).
+
+            LOG.infof("RabbitMQ connection established (publisher confirms on); exchanges '%s' (identity) and '%s' (email)",
                     identityExchange, emailExchange);
         } catch (IOException | TimeoutException e) {
             LOG.error("Failed to establish RabbitMQ connection - events will not be published", e);
@@ -91,38 +114,81 @@ public class RabbitMQConnectionManager {
     }
 
     /**
-     * Publishes a message. Thread-safe (synchronized), since a RabbitMQ Channel
-     * is not officially thread-safe for concurrent publishing.
+     * Publishes a message and waits for the broker to confirm it. Thread-safe
+     * (synchronized), since a RabbitMQ Channel is not officially thread-safe
+     * for concurrent publishing.
      *
-     * <p>The envelope {@code type} ("user", "client", "email") is used both as
-     * the routing key and to select the target exchange: "email" type messages
-     * go to the email exchange, everything else goes to the identity exchange.
+     * <p>The exchange and routing key are passed in explicitly by the caller -
+     * this class never derives either from the message. The routing key is
+     * built once from the envelope fields (see
+     * {@code RabbitMQEventEnvelope.routingKey}).
+     *
+     * <p>Returns {@code true} only once the broker has acked the message.
+     * A publish that throws, is nacked, or is not confirmed within the
+     * configured timeout returns {@code false}.
+     *
+     * @param exchange          the target exchange (see {@link #identityExchange()} /
+     *                          {@link #emailExchange()})
+     * @param routingKey        the topic routing key
+     * @param messageId         the envelope {@code id}, set as the AMQP messageId
+     * @param expirationMillis  per-message TTL in milliseconds, or {@code null}
+     *                          for no expiration. Set for email commands only
+     *                          (a code/link delivered after its own expiry is
+     *                          worse than one never sent); never for user facts.
+     * @param body              the serialized message body
      */
-    public synchronized boolean publish(String type, byte[] body) {
-        String exchangeName = exchangeFor(type);
+    public synchronized boolean publish(String exchange, String routingKey, String messageId,
+                                        Long expirationMillis, byte[] body) {
         if (channel == null || !channel.isOpen()) {
             reconnectIfDue();
         }
         if (channel == null || !channel.isOpen()) {
-            LOG.warnf("RabbitMQ channel not available, event with routing key '%s' was not published", type);
+            LOG.warnf("RabbitMQ channel not available, message with routing key '%s' was not published", routingKey);
             return false;
         }
         try {
-            channel.basicPublish(exchangeName, type, null, body);
-            return true;
+            channel.basicPublish(exchange, routingKey, buildProperties(messageId, expirationMillis), body);
+            boolean acked = channel.waitForConfirms(confirmTimeoutMillis);
+            if (!acked) {
+                LOG.warnf("RabbitMQ broker nacked message with routing key '%s' on exchange '%s'",
+                        routingKey, exchange);
+            }
+            return acked;
         } catch (IOException e) {
-            LOG.errorf(e, "Failed to publish event with routing key '%s'", type);
+            LOG.errorf(e, "Failed to publish message with routing key '%s'", routingKey);
             GlitchTipReporter.captureException(e, "rabbitmq.publish", Map.of(
-                    "exchange", exchangeName,
-                    "routingKey", type
+                    "exchange", exchange,
+                    "routingKey", routingKey
             ));
             closeCurrentConnection();
+            return false;
+        } catch (TimeoutException e) {
+            LOG.warnf(e, "Timed out after %dms waiting for broker to confirm message with routing key '%s'",
+                    confirmTimeoutMillis, routingKey);
+            GlitchTipReporter.captureException(e, "rabbitmq.publish.confirm-timeout", Map.of(
+                    "exchange", exchange,
+                    "routingKey", routingKey
+            ));
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.warnf("Interrupted while waiting for broker to confirm message with routing key '%s'", routingKey);
             return false;
         }
     }
 
-    private String exchangeFor(String type) {
-        return EMAIL_TYPE.equals(type) ? emailExchange : identityExchange;
+    private AMQP.BasicProperties buildProperties(String messageId, Long expirationMillis) {
+        AMQP.BasicProperties.Builder props = new AMQP.BasicProperties.Builder()
+                .deliveryMode(DELIVERY_MODE_PERSISTENT)
+                .contentType(CONTENT_TYPE_JSON);
+        if (messageId != null) {
+            props.messageId(messageId);
+        }
+        if (expirationMillis != null) {
+            // RabbitMQ expects the per-message TTL as a string, in milliseconds.
+            props.expiration(Long.toString(Math.max(0L, expirationMillis)));
+        }
+        return props.build();
     }
 
     public synchronized void close() {

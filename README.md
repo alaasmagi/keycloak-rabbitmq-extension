@@ -11,7 +11,7 @@ This project is a custom Keycloak extension that publishes identity and email-re
 
 The extension covers four separate Keycloak integration points:
 
-* **Event Listener** - publishes user, role and client events.
+* **Event Listener** - publishes user lifecycle events.
 * **Password Reset Authenticator** - replaces Keycloak's default reset-email step and publishes the real reset link.
 * **Verify Email Required Action** - replaces Keycloak's default verify-email required action and publishes the real verification link.
 * **Email OTP Authenticator** - adds an email-based one-time-code second factor.
@@ -36,6 +36,7 @@ RABBITMQ_PASSWORD=<your-rabbitmq-password>      # Default: guest
 RABBITMQ_VHOST=<your-rabbitmq-vhost>            # Default: /
 RABBITMQ_IDENTITY_EXCHANGE=<identity-exchange>  # Default: identity.events
 RABBITMQ_EMAIL_EXCHANGE=<email-exchange>        # Default: email.commands
+RABBITMQ_PUBLISH_CONFIRM_TIMEOUT_MS=<millis>    # Default: 5000
 
 EMAIL_OTP_VALIDITY_SECONDS=<otp-validity-time>  # Default: 300
 
@@ -47,7 +48,9 @@ GLITCHTIP_SAMPLE_RATE=<0.0-to-1.0>              # Optional, default: 1.0
 
 These variables keep RabbitMQ access information outside the source code and make it possible to use different RabbitMQ hosts, virtual hosts and exchanges in different environments.
 
-Messages are routed to one of two topic exchanges based on their envelope `type`: `user` and `client` events go to the identity exchange (`RABBITMQ_IDENTITY_EXCHANGE`, default `identity.events`), while `email` events (password reset, verify email, OTP) go to the email exchange (`RABBITMQ_EMAIL_EXCHANGE`, default `email.commands`).
+Messages go to one of two topic exchanges chosen by the publishing call site, not derived from the message: user facts (the event listener) go to the identity exchange (`RABBITMQ_IDENTITY_EXCHANGE`, default `identity.events`), while email commands (password reset, verify email, OTP) go to the email exchange (`RABBITMQ_EMAIL_EXCHANGE`, default `email.commands`). Every message is published with a routing key of `{source}.{tenant}.{action}` (e.g. `identity-hub.my-realm.user-2fa-otp`).
+
+`RABBITMQ_PUBLISH_CONFIRM_TIMEOUT_MS` bounds how long a publish waits for the broker to confirm the message (see the RabbitMQ design section). The extension does **not** declare exchanges - the topology is created and owned outside this extension.
 
 GlitchTip reporting is optional. If `GLITCHTIP_DSN` is not set, the extension only uses normal Keycloak/JBoss logging.
 
@@ -107,6 +110,7 @@ services:
       RABBITMQ_VHOST: "/"
       RABBITMQ_IDENTITY_EXCHANGE: identity.events
       RABBITMQ_EMAIL_EXCHANGE: email.commands
+      RABBITMQ_PUBLISH_CONFIRM_TIMEOUT_MS: "5000"
       EMAIL_OTP_VALIDITY_SECONDS: "300"
 
       GLITCHTIP_DSN: <your-glitchtip-dsn>
@@ -115,7 +119,7 @@ services:
       GLITCHTIP_SAMPLE_RATE: "1.0"
 ```
 
-The RabbitMQ exchanges are declared automatically by the extension as durable topic exchanges.
+The RabbitMQ topology (exchanges, queues, bindings) is **not** created by this extension - it must already exist, provisioned by whoever owns the broker. Both exchanges are expected to be durable `topic` exchanges.
 
 ## Activation in Keycloak
 
@@ -168,13 +172,13 @@ All activation steps are realm-specific, so they should be repeated in every rea
 * Publishes admin-created and self-registered user events
 * Publishes user deletion events
 * Publishes user update events
-* Publishes role assignment and role removal events
-* Publishes client deletion events
+* Publishes user enabled/disabled (ban/unban) events
 * Publishes password reset links through RabbitMQ
 * Publishes email verification links through RabbitMQ
 * Provides email-based OTP authentication
-* Uses ISO-8601 UTC timestamps in event messages
-* Uses a readable `identity.{realmName}` value in the `source` field instead of internal realm UUIDs where possible
+* Waits for RabbitMQ publisher confirms before reporting a publish as successful
+* Uses ISO-8601 UTC millisecond-precision timestamps in event messages
+* Carries the human-readable realm name in the `tenant` field instead of internal realm UUIDs where possible
 
 ## Design choices
 
@@ -201,29 +205,45 @@ public class RabbitMQConnectionManager {
     private Connection connection;
     private Channel channel;
 
-    public synchronized boolean publish(String type, byte[] body) {
-        String exchangeName = "email".equals(type) ? emailExchange : identityExchange;
+    // The exchange and routing key are passed in explicitly by the caller;
+    // the manager never derives either from the message.
+    public synchronized boolean publish(String exchange, String routingKey, String messageId,
+                                        Long expirationMillis, byte[] body) {
         if (channel == null || !channel.isOpen()) {
             reconnectIfDue();
         }
         if (channel == null || !channel.isOpen()) {
             return false;
         }
-        channel.basicPublish(exchangeName, type, null, body);
-        return true;
+        channel.basicPublish(exchange, routingKey, buildProperties(messageId, expirationMillis), body);
+        return channel.waitForConfirms(confirmTimeoutMillis); // false = nacked / not confirmed
     }
 }
 ```
+
+The exchange is chosen by the call site (`connectionManager.identityExchange()` for user facts, `connectionManager.emailExchange()` for email commands) and the routing key is built once from the envelope fields by `RabbitMQEventEnvelope.routingKey(...)`. Neither is derived from the message body or from the exchange.
 
 All four factories (event listener, password reset, verify email, email OTP) share a single `RabbitMQConnectionManager` instance via `RabbitMQConnectionManagerHolder`. The holder is reference-counted: each factory acquires the connection in `init()` and releases it in `close()`. The underlying AMQP connection is closed only when the last factory releases it (i.e. on Keycloak shutdown). This avoids opening multiple AMQP connections for a single Keycloak instance.
 
 If RabbitMQ is unavailable when Keycloak starts, the manager retries lazily on later publish attempts. Publishing returns a success flag so user-facing flows can avoid showing a reset, verification or OTP screen when the email message was not actually queued.
 
-Both exchanges are declared automatically with the following settings:
+#### Publisher confirms
 
-* Type: `topic`
-* Durable: `true`
-* Auto-delete: `false`
+The channel runs in publisher-confirm mode. A `basicPublish` that returns without throwing only means the client handed the frame to the socket - it does **not** mean the broker accepted the message. After publishing, `publish` waits for the broker's ack via `waitForConfirms(confirmTimeoutMillis)` and only returns `true` once the message is confirmed. A publish that throws, is nacked, or is not confirmed within `RABBITMQ_PUBLISH_CONFIRM_TIMEOUT_MS` (default 5000 ms) returns `false`. The timeout is bounded so a hung broker cannot block a caller such as a login thread. This matters most for the email OTP flow, which must not send the user to the code-entry screen for a code the broker never actually accepted.
+
+#### Message properties
+
+Every message is published with:
+
+* `deliveryMode = 2` (persistent)
+* `messageId` = the envelope `id`
+* `contentType = application/json`
+
+Email commands additionally set `expiration` to the number of milliseconds remaining until the code/link's `expiresAt`, so the broker drops a credential that has already outlived its own validity. User facts never carry an expiration.
+
+#### Exchanges and topology
+
+The extension does **not** declare exchanges. The topology is created and owned outside this extension. Declaring an exchange here with arguments that did not match the existing one would fail with `PRECONDITION_FAILED` and take the channel down, after which nothing would be published. Both exchanges are expected to be provisioned externally as durable `topic` exchanges.
 
 ### GlitchTip error reporting
 
@@ -246,31 +266,32 @@ Supported environment variables:
 
 The event listener is implemented with `RabbitMQEventListenerProvider` and `RabbitMQEventListenerProviderFactory`.
 
-All event-listener messages are published to the identity exchange (`RABBITMQ_IDENTITY_EXCHANGE`). The RabbitMQ routing key is the envelope `type`, not the `action`: user and role events use routing key `user`, and client events use routing key `client`. The concrete thing that happened is carried in the `action` field of the message body:
+All event-listener messages are published to the identity exchange (`RABBITMQ_IDENTITY_EXCHANGE`) with routing key `{source}.{tenant}.{action}` (e.g. `identity-hub.my-realm.user-created`). The concrete thing that happened is the `action`, one hyphenated segment:
 
-| `type` (routing key) | `action` | Description |
-|---|---|---|
-| `user` | `user.created` | User self-registered or was created by an admin |
-| `user` | `user.deleted` | User deleted their own account or was deleted by an admin |
-| `user` | `user.updated` | User data was updated by an admin |
-| `user` | `user.enabled` | User enabled flag changed to `true` |
-| `user` | `user.disabled` | User enabled flag changed to `false` |
-| `user` | `user.role.assigned` | Realm or client role was added to the user |
-| `user` | `user.role.removed` | Realm or client role was removed from the user |
-| `client` | `client.deleted` | Client was deleted from the realm |
+| `action` | Description |
+|---|---|
+| `user-created` | User self-registered or was created by an admin |
+| `user-deleted` | User deleted their own account or was deleted by an admin |
+| `user-updated` | User data was updated by an admin |
+| `user-enabled` | User enabled flag changed to `true` |
+| `user-disabled` | User enabled flag changed to `false` |
 
-Keycloak does not have a separate ban/unban event. This implementation treats the user's `enabled` flag as the source of truth and keeps a bounded in-memory LRU cache (up to 10,000 entries) of the last known enabled state. This makes it possible to publish `user.enabled` and `user.disabled` only when the observed value changes.
+Role-mapping and client changes are intentionally **not** published: roles already reach the apps in the access token, so a mirrored role table would be a second source of truth that disagrees with it.
+
+Keycloak does not have a separate ban/unban event. This implementation treats the user's `enabled` flag as the source of truth and keeps a bounded in-memory LRU cache (up to 10,000 entries) of the last known enabled state. This makes it possible to publish `user-enabled` and `user-disabled` only when the observed value changes.
 
 #### Event listener message contract
 
-Event-listener messages use the shared envelope: a `type` (category, also the RabbitMQ routing key), a `source` (`identity.{realmName}`), an `action` (the concrete thing that happened), a `timestamp` and a `content` object:
+Event-listener messages use the shared envelope: an `id`, a `source` (always `identity-hub`), a `tenant` (the human-readable realm name), an `action` (the concrete thing that happened), a `timestamp`, a `contentVersion` and a `content` object:
 
 ```json
 {
-  "type": "user",
-  "source": "identity.my-realm",
-  "action": "user.created",
-  "timestamp": "2026-07-08T12:44:37.408804148Z",
+  "id": "3f1c2d4e-...",
+  "source": "identity-hub",
+  "tenant": "my-realm",
+  "action": "user-created",
+  "timestamp": "2026-07-08T12:44:37.408Z",
+  "contentVersion": "1.0",
   "content": {
     "userId": "13af8b9e-...",
     "email": "user@example.com",
@@ -283,10 +304,12 @@ Event-listener messages use the shared envelope: a `type` (category, also the Ra
 
 | Field | Type | Present when | Description |
 |---|---|---|---|
-| `type` | string | Always | Message category and RabbitMQ routing key: `user` for user/role events, `client` for `client.deleted`. |
-| `source` | string | Always | `identity.{realmName}`, using the human-readable realm name when resolvable (falls back to the realm id). |
-| `action` | string | Always | The concrete thing that happened (e.g. `user.created`). |
-| `timestamp` | string | Always | ISO-8601 UTC timestamp generated by the extension. |
+| `id` | string | Always | Fresh UUID per message; also set as the AMQP `messageId`. |
+| `source` | string | Always | Constant value: `identity-hub`. Must match the shared C# package's `DefaultSources.IdentityHub`. |
+| `tenant` | string | Always | The human-readable realm name when resolvable (falls back to the realm id). |
+| `action` | string | Always | The concrete thing that happened (e.g. `user-created`). |
+| `timestamp` | string | Always | ISO-8601 UTC timestamp, millisecond precision, generated by the extension. |
+| `contentVersion` | string | Always | Opaque content-shape version string (currently `1.0`), passed through verbatim. |
 | `content` | object | Always | Event-specific content (see below). |
 
 User `content` fields:
@@ -294,8 +317,8 @@ User `content` fields:
 | Field | Type | Present when | Description |
 |---|---|---|---|
 | `userId` | string | Always | Keycloak user id. |
-| `email` | string | User still resolvable | Destination email address. Omitted for `user.deleted`. |
-| `username` | string | User still resolvable | Keycloak username. Omitted for `user.deleted`. |
+| `email` | string | User still resolvable | Destination email address. Omitted for `user-deleted`. |
+| `username` | string | User still resolvable | Keycloak username. Omitted for `user-deleted`. |
 | `fullName` | string | User has a first and/or last name | First and last name joined with a space. |
 | `locale` | string | User has non-blank `locale` attribute | Optional locale hint. |
 
@@ -303,23 +326,22 @@ Event-listener structures by `action`:
 
 | `action` | Structure notes |
 |---|---|
-| `user.created` | `content` = `{ userId, email, username, fullName, locale }`. |
-| `user.deleted` | `content` = `{ userId }` only; the user no longer exists. |
-| `user.updated` | `content` = `{ userId, email, username, fullName, locale }`. |
-| `user.enabled` | `content` = `{ userId, email, username, fullName, locale }`. |
-| `user.disabled` | `content` = `{ userId, email, username, fullName, locale }`. |
-| `user.role.assigned` | `content` = `{ userId, roles }`, where `roles` is the role-mapping array Keycloak provides. |
-| `user.role.removed` | `content` = `{ userId, roles }`, where `roles` is the role-mapping array Keycloak provides. |
-| `client.deleted` | `type` is `client`; `content` = `{ client }` with the client representation when Keycloak provides it. |
+| `user-created` | `content` = `{ userId, email, username, fullName, locale }`. |
+| `user-deleted` | `content` = `{ userId }` only; the user no longer exists. |
+| `user-updated` | `content` = `{ userId, email, username, fullName, locale }`. |
+| `user-enabled` | `content` = `{ userId, email, username, fullName, locale }`. |
+| `user-disabled` | `content` = `{ userId, email, username, fullName, locale }`. |
 
-Example `user.disabled` message:
+Example `user-disabled` message:
 
 ```json
 {
-  "type": "user",
-  "source": "identity.my-realm",
-  "action": "user.disabled",
-  "timestamp": "2026-07-08T12:44:37.408804148Z",
+  "id": "3f1c2d4e-...",
+  "source": "identity-hub",
+  "tenant": "my-realm",
+  "action": "user-disabled",
+  "timestamp": "2026-07-08T12:44:37.408Z",
+  "contentVersion": "1.0",
   "content": {
     "userId": "13af8b9e-...",
     "email": "user@example.com",
@@ -330,52 +352,31 @@ Example `user.disabled` message:
 }
 ```
 
-Example `client.deleted` message:
-
-```json
-{
-  "type": "client",
-  "source": "identity.my-realm",
-  "action": "client.deleted",
-  "timestamp": "2026-07-08T12:44:37.408804148Z",
-  "content": {
-    "client": {
-      "id": "7d4d...",
-      "clientId": "my-app"
-    }
-  }
-}
-```
-
 ### Email message contract
 
-Password reset, verify-email and email OTP messages use the shared envelope with `type` set to `email`. They are published to the email exchange (`RABBITMQ_EMAIL_EXCHANGE`) with the routing key `email` (the envelope `type`); the specific email is identified by the `action` field:
+Password reset, verify-email and email OTP messages use the same shared envelope. They are published to the email exchange (`RABBITMQ_EMAIL_EXCHANGE`) with routing key `{source}.{tenant}.{action}` (e.g. `identity-hub.my-realm.user-password-reset`); the specific email is identified by the `action` field:
 
 ```json
 {
-  "type": "email",
-  "source": "identity.my-realm",
-  "action": "user.password.reset",
-  "timestamp": "2026-07-08T12:44:37.408804148Z",
+  "id": "3f1c2d4e-...",
+  "source": "identity-hub",
+  "tenant": "my-realm",
+  "action": "user-password-reset",
+  "timestamp": "2026-07-08T12:44:37.408Z",
+  "contentVersion": "1.0",
   "content": {
     "userId": "13af8b9e-...",
     "email": "user@example.com",
     "fullName": "Test User",
     "actionLink": "https://identity.example.com/realms/my-realm/login-actions/action-token?key=...",
     "expiresAt": "2026-07-02T21:45:00Z",
-    "expiresInMinutes": 60,
+    "validForMinutes": 60,
     "locale": "et"
   }
 }
 ```
 
-| Field | Type | Present when | Description |
-|---|---|---|---|
-| `type` | string | Always | Constant value: `email`. |
-| `source` | string | Always | `identity.{realmName}`. |
-| `action` | string | Always | One of `user.password.reset`, `user.verify` or `user.2fa.otp`. |
-| `timestamp` | string | Always | ISO-8601 UTC timestamp generated by the extension. |
-| `content` | object | Always | Email-specific content for the external email service. |
+The envelope fields (`id`, `source`, `tenant`, `action`, `timestamp`, `contentVersion`) are identical to the event-listener envelope described above. The `action` is one of `user-password-reset`, `user-verify` or `user-2fa-otp`. Email commands are additionally published with an AMQP `expiration` equal to the milliseconds remaining until `expiresAt`.
 
 Shared `content` fields:
 
@@ -385,16 +386,16 @@ Shared `content` fields:
 | `email` | string | Always | Destination email address. |
 | `fullName` | string | User has a first and/or last name | First and last name joined with a space. |
 | `expiresAt` | string | Always | ISO-8601 UTC expiration timestamp. |
-| `expiresInMinutes` | number | Always | Validity seconds divided by 60 using integer division. |
+| `validForMinutes` | number | Always | Validity seconds divided by 60 using integer division. |
 | `locale` | string | User has non-blank `locale` attribute | Optional locale hint for the external email service. |
 
 Action-specific `content` fields:
 
 | Action | Field | Type | Description |
 |---|---|---|---|
-| `user.password.reset` | `actionLink` | string | Keycloak action-token URL for password reset. |
-| `user.verify` | `actionLink` | string | Keycloak action-token URL for email verification. |
-| `user.2fa.otp` | `otpCode` | string | Six-digit email OTP code, including leading zeros when generated. |
+| `user-password-reset` | `actionLink` | string | Keycloak action-token URL for password reset. |
+| `user-verify` | `actionLink` | string | Keycloak action-token URL for email verification. |
+| `user-2fa-otp` | `otpCode` | string | Six-digit email OTP code, including leading zeros when generated. |
 
 ### Password Reset Authenticator
 
@@ -408,17 +409,19 @@ Example message:
 
 ```json
 {
-  "type": "email",
-  "source": "identity.my-realm",
-  "action": "user.password.reset",
-  "timestamp": "2026-07-08T12:44:37.408804148Z",
+  "id": "3f1c2d4e-...",
+  "source": "identity-hub",
+  "tenant": "my-realm",
+  "action": "user-password-reset",
+  "timestamp": "2026-07-08T12:44:37.408Z",
+  "contentVersion": "1.0",
   "content": {
     "userId": "13af8b9e-...",
     "email": "user@example.com",
     "fullName": "Test User",
     "actionLink": "https://identity.example.com/realms/my-realm/login-actions/action-token?key=...",
     "expiresAt": "2026-07-02T21:45:00Z",
-    "expiresInMinutes": 60,
+    "validForMinutes": 60,
     "locale": "et"
   }
 }
@@ -442,17 +445,19 @@ Example message:
 
 ```json
 {
-  "type": "email",
-  "source": "identity.my-realm",
-  "action": "user.verify",
-  "timestamp": "2026-07-08T12:44:37.408804148Z",
+  "id": "3f1c2d4e-...",
+  "source": "identity-hub",
+  "tenant": "my-realm",
+  "action": "user-verify",
+  "timestamp": "2026-07-08T12:44:37.408Z",
+  "contentVersion": "1.0",
   "content": {
     "userId": "13af8b9e-...",
     "email": "user@example.com",
     "fullName": "Test User",
     "actionLink": "https://identity.example.com/realms/my-realm/login-actions/action-token?key=...",
     "expiresAt": "2026-07-02T21:45:00Z",
-    "expiresInMinutes": 60,
+    "validForMinutes": 60,
     "locale": "et"
   }
 }
@@ -483,17 +488,19 @@ Example message:
 
 ```json
 {
-  "type": "email",
-  "source": "identity.my-realm",
-  "action": "user.2fa.otp",
-  "timestamp": "2026-07-08T12:44:37.408804148Z",
+  "id": "3f1c2d4e-...",
+  "source": "identity-hub",
+  "tenant": "my-realm",
+  "action": "user-2fa-otp",
+  "timestamp": "2026-07-08T12:44:37.408Z",
+  "contentVersion": "1.0",
   "content": {
     "userId": "13af8b9e-...",
     "email": "user@example.com",
     "fullName": "Test User",
     "otpCode": "482913",
     "expiresAt": "2026-07-02T20:50:00Z",
-    "expiresInMinutes": 5,
+    "validForMinutes": 5,
     "locale": "et"
   }
 }
@@ -507,20 +514,28 @@ EMAIL_OTP_VALIDITY_SECONDS=300
 
 ### Event envelope helper
 
-`RabbitMQEventEnvelope` keeps the common top-level event fields consistent for user/admin events and email events.
+`RabbitMQEventEnvelope` keeps the common top-level fields consistent for user/admin events and email events, and is the single place the routing key is assembled.
 
 ```java
-public static Map<String, Object> build(String eventType, String realmName) {
+public static Map<String, Object> build(String action, String realmName) {
     Map<String, Object> message = new LinkedHashMap<>();
-    message.put("eventType", eventType);
-    message.put("eventSource", DefaultEventTypes.EVENT_SOURCE);
-    message.put("realmName", realmName);
-    message.put("timestamp", Instant.now().toString());
+    message.put("id", UUID.randomUUID().toString());
+    message.put("source", DefaultEventTypes.SOURCE_IDENTITY_HUB);
+    message.put("tenant", realmName);
+    message.put("action", action);
+    message.put("timestamp", Instant.now().truncatedTo(ChronoUnit.MILLIS).toString());
+    message.put("contentVersion", CONTENT_VERSION);
     return message;
+}
+
+// Routing key is derived only from envelope fields, never from a literal
+// at a call site and never from the target exchange.
+public static String routingKey(Map<String, Object> envelope) {
+    return envelope.get("source") + "." + envelope.get("tenant") + "." + envelope.get("action");
 }
 ```
 
-Email events add a nested `payload` field to this envelope. User/admin events add fields such as `userId`, `representation` and `banReason`.
+The caller adds its per-action payload under the `content` key afterwards; because a `LinkedHashMap` preserves insertion order, `content` stays last, matching the documented field order.
 
 ### Dependency packaging
 
@@ -548,7 +563,7 @@ This extension is tightly coupled to the Keycloak version configured in `pom.xml
 
 Event-listener messages are best-effort: normal admin/user lifecycle events are logged if RabbitMQ publishing fails, but the original Keycloak admin action is not rolled back. User-facing email flows are stricter and fail the authentication step when their RabbitMQ message cannot be published.
 
-The `user.enabled` and `user.disabled` events rely on an in-memory last-known-state cache (bounded LRU, up to 10,000 entries). After a Keycloak restart, the first observed update for a user can emit an enabled/disabled event even if the enabled flag did not change in that update.
+The `user-enabled` and `user-disabled` events rely on an in-memory last-known-state cache (bounded LRU, up to 10,000 entries). After a Keycloak restart, the first observed update for a user can emit an enabled/disabled event even if the enabled flag did not change in that update.
 
 ### CI
 

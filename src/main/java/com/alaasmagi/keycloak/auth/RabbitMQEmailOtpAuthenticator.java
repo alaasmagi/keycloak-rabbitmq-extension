@@ -2,6 +2,7 @@ package com.alaasmagi.keycloak.auth;
 
 import com.alaasmagi.keycloak.events.DefaultEventTypes;
 import com.alaasmagi.keycloak.events.RabbitMQEmailEventPayloads;
+import com.alaasmagi.keycloak.events.RabbitMQEventEnvelope;
 import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -154,22 +155,27 @@ public class RabbitMQEmailOtpAuthenticator implements Authenticator {
 
     private boolean publishOtpEvent(RealmModel realm, UserModel user, String code, long expiresAtEpochSeconds) {
         try {
+            Instant expiresAt = Instant.ofEpochSecond(expiresAtEpochSeconds);
             Map<String, Object> content = RabbitMQEmailEventPayloads.build(
                     user,
                     "otpCode",
                     code,
-                    Instant.ofEpochSecond(expiresAtEpochSeconds),
+                    expiresAt,
                     validitySeconds
             );
 
             Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
-                    DefaultEventTypes.TYPE_EMAIL,
                     DefaultEventTypes.EMAIL_OTP,
                     realm.getName(),
                     content
             );
 
-            return connectionManager.publish(DefaultEventTypes.TYPE_EMAIL, MAPPER.writeValueAsBytes(message));
+            return connectionManager.publish(
+                    connectionManager.emailExchange(),
+                    RabbitMQEventEnvelope.routingKey(message),
+                    (String) message.get("id"),
+                    RabbitMQEmailEventPayloads.expirationMillis(expiresAt),
+                    MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish email OTP event to RabbitMQ", e);
             GlitchTipReporter.captureException(e, "email-otp.publish", Map.of(

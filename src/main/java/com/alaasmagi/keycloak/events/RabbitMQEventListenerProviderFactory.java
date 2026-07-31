@@ -33,12 +33,14 @@ import java.util.Map;
  * reliable than Keycloak's own SPI config, which requires editing
  * keycloak.conf):
  *
- *   RABBITMQ_HOST        (default: "rabbitmq")
- *   RABBITMQ_PORT        (default: 5672)
- *   RABBITMQ_USERNAME    (default: "guest")
- *   RABBITMQ_PASSWORD    (default: "guest")
- *   RABBITMQ_VHOST       (default: "/")
- *   RABBITMQ_EXCHANGE    (default: "identity-events")
+ *   RABBITMQ_HOST                       (default: "rabbitmq")
+ *   RABBITMQ_PORT                       (default: 5672)
+ *   RABBITMQ_USERNAME                   (default: "guest")
+ *   RABBITMQ_PASSWORD                   (default: "guest")
+ *   RABBITMQ_VHOST                      (default: "/")
+ *   RABBITMQ_IDENTITY_EXCHANGE          (default: "identity.events")
+ *   RABBITMQ_EMAIL_EXCHANGE             (default: "email.commands")
+ *   RABBITMQ_PUBLISH_CONFIRM_TIMEOUT_MS (default: 5000)
  */
 public class RabbitMQEventListenerProviderFactory implements EventListenerProviderFactory {
 

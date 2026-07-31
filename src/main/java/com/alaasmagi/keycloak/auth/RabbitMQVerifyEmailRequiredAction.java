@@ -2,6 +2,7 @@ package com.alaasmagi.keycloak.auth;
 
 import com.alaasmagi.keycloak.events.DefaultEventTypes;
 import com.alaasmagi.keycloak.events.RabbitMQEmailEventPayloads;
+import com.alaasmagi.keycloak.events.RabbitMQEventEnvelope;
 import com.alaasmagi.keycloak.observability.GlitchTipReporter;
 import com.alaasmagi.keycloak.rabbitmq.RabbitMQConnectionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -174,13 +175,17 @@ public class RabbitMQVerifyEmailRequiredAction implements RequiredActionProvider
             );
 
             Map<String, Object> message = RabbitMQEmailEventPayloads.buildMessage(
-                    DefaultEventTypes.TYPE_EMAIL,
                     DefaultEventTypes.VERIFY_EMAIL,
                     realm.getName(),
                     content
             );
 
-            return connectionManager.publish(DefaultEventTypes.TYPE_EMAIL, MAPPER.writeValueAsBytes(message));
+            return connectionManager.publish(
+                    connectionManager.emailExchange(),
+                    RabbitMQEventEnvelope.routingKey(message),
+                    (String) message.get("id"),
+                    RabbitMQEmailEventPayloads.expirationMillis(expiresAt),
+                    MAPPER.writeValueAsBytes(message));
         } catch (Exception e) {
             LOG.error("Failed to publish email verification event to RabbitMQ", e);
             GlitchTipReporter.captureException(e, "verify-email.publish", Map.of(

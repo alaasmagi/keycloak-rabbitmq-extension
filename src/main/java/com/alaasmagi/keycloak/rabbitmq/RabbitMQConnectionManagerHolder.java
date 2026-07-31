@@ -38,11 +38,12 @@ public final class RabbitMQConnectionManagerHolder {
             String vhost = EnvConfig.get("RABBITMQ_VHOST", "/");
             String identityExchange = EnvConfig.get("RABBITMQ_IDENTITY_EXCHANGE", "identity.events");
             String emailExchange = EnvConfig.get("RABBITMQ_EMAIL_EXCHANGE", "email.commands");
+            int confirmTimeoutMs = EnvConfig.getInt("RABBITMQ_PUBLISH_CONFIRM_TIMEOUT_MS", 5000);
 
-            LOG.infof("Creating shared RabbitMQ connection: host=%s port=%d vhost=%s identityExchange=%s emailExchange=%s",
-                    host, port, vhost, identityExchange, emailExchange);
+            LOG.infof("Creating shared RabbitMQ connection: host=%s port=%d vhost=%s identityExchange=%s emailExchange=%s confirmTimeoutMs=%d",
+                    host, port, vhost, identityExchange, emailExchange, confirmTimeoutMs);
             instance = new RabbitMQConnectionManager(host, port, username, password, vhost,
-                    identityExchange, emailExchange);
+                    identityExchange, emailExchange, confirmTimeoutMs);
         }
         refCount++;
         LOG.debugf("RabbitMQ connection acquired (ref count: %d)", refCount);
