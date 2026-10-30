@@ -37,7 +37,7 @@ public final class RabbitMQConnectionManagerHolder {
             String password = EnvConfig.get("RABBITMQ_PASSWORD", "guest");
             String vhost = EnvConfig.get("RABBITMQ_VHOST", "/");
             String identityExchange = EnvConfig.get("RABBITMQ_IDENTITY_EXCHANGE", "identity.events");
-            String emailExchange = EnvConfig.get("RABBITMQ_EMAIL_EXCHANGE", "email.commands");
+            String emailExchange = EnvConfig.get("RABBITMQ_EMAIL_EXCHANGE", "notification-hub.commands");
             int confirmTimeoutMs = EnvConfig.getInt("RABBITMQ_PUBLISH_CONFIRM_TIMEOUT_MS", 5000);
 
             LOG.infof("Creating shared RabbitMQ connection: host=%s port=%d vhost=%s identityExchange=%s emailExchange=%s confirmTimeoutMs=%d",

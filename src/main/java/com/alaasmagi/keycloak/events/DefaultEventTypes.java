@@ -15,14 +15,14 @@ public final class DefaultEventTypes {
     // segment each - these double as the last segment of the routing key
     // (see RabbitMQEventEnvelope.routingKey).
     // ---------------------------------------------------------------------
-    public static final String USER_CREATED = "user-created";
-    public static final String USER_DELETED = "user-deleted";
-    public static final String USER_UPDATED = "user-updated";
-    public static final String USER_ENABLED = "user-enabled";
-    public static final String USER_DISABLED = "user-disabled";
-    public static final String PASSWORD_RESET = "user-password-reset";
-    public static final String VERIFY_EMAIL = "user-verify";
-    public static final String EMAIL_OTP = "user-2fa-otp";
+    public static final String USER_CREATED = "email-user-created";
+    public static final String USER_DELETED = "email-user-deleted";
+    public static final String USER_UPDATED = "email-user-updated";
+    public static final String USER_ENABLED = "email-user-enabled";
+    public static final String USER_DISABLED = "email-user-disabled";
+    public static final String PASSWORD_RESET = "email-user-password-reset";
+    public static final String VERIFY_EMAIL = "email-user-verify";
+    public static final String EMAIL_OTP = "email-user-2fa-otp";
 
     private DefaultEventTypes() {
     }
